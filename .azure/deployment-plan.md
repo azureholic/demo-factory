@@ -1,6 +1,6 @@
 # Azure Deployment Plan
 
-> **Status:** Validated
+> **Status:** Deployed
 
 Generated: 2026-11-14T10:38:00+01:00
 Updated: 2026-11-14T15:25:00+01:00
@@ -143,26 +143,28 @@ Updated: 2026-11-14T15:25:00+01:00
 | Resource Group | `rg-<workload>-<env>-<region>` | `rg-demofactory-dev-swc` |
 | Web UI + BFF Container App (`web`) | `ca-<workload>-web-<env>-<region>` | `ca-demofactory-web-dev-swc` |
 | Orchestrator Container App (Reference) | `ca-<workload>-orch-<env>-<region>` | `ca-demofactory-orch-dev-swc` |
-| Container Apps Environment | `cae-<workload>-<env>-<region>` | `cae-demofactory-dev-swc` |
+| Container Apps Environment | `cae-<workload>-<env>-<region>` | `cae-demofactory-dev-swc` (`destination: 'azure-monitor'` + `diag-cae-demofactory-dev-swc`) |
 | Virtual Network (`10.200.0.0/16`) | `vnet-<workload>-<env>-<region>` | `vnet-demofactory-dev-swc` (`snet-cae-demofactory-dev-swc` `10.200.0.0/23`, `snet-pep-demofactory-dev-swc` `10.200.2.0/24`) |
 | Private Endpoints + NICs | `pep-<svc>-<workload>-<env>-<region>` | `pep-sql-demofactory-dev-swc`, `pep-kv-demofactory-dev-swc`, `pep-st-demofactory-dev-swc` (`nic-pep-*`) |
-| Azure SQL Server & Database | `sql-<workload>-<env>-<region>-<token>` / `sqldb-*` | `sql-demofactory-dev-swc-<token>` / `sqldb-demofactory-dev` |
-| User-Assigned Managed Identity | `id-<workload>-<env>-<region>` | `id-demofactory-dev-swc` |
-| Key Vault | `kv-<short>-<env>-<region>-<token>` | `kv-df-dev-swc-<token>` |
-| Storage Account | `st<short><env><region><token>` | `stdfdevswc<token>` |
-| Container Registry | `cr<workload><env><region><token>` | `crdemofactorydevswc<token>` |
-| Durable Task Scheduler | `dts-<workload>-<env>-<region>-<token>` | `dts-demofactory-dev-swc-<token>` |
-| Microsoft Foundry & Model | `aif-<workload>-<env>-<region>-<token>` / `proj-*` | `aif-demofactory-dev-swc-<token>` / `proj-demofactory-dev-swc` / **`orchestrator-model` (`MAI-Thinking-1` `2026-06-01`, `GlobalStandard`)** |
+| Azure SQL Server & Database | `sql-<workload>-<env>-<region>-<token>` / `sqldb-*` | `sql-demofactory-dev-swc-7x73n` / `sqldb-demofactory-dev` |
+| User-Assigned Managed Identity | `id-<workload>-<env>-<region>` | `id-demofactory-dev-swc` (`dd5f3614-5cea-4399-bacf-734c9e3fe937`) |
+| Key Vault | `kv-<short>-<env>-<region>-<token>` | `kv-df-dev-swc-7x73n` |
+| Storage Account | `st<short><env><region><token>` | `stdfdevswc7x73n` |
+| Container Registry | `cr<workload><env><region><token>` | `crdemofactorydevswc7x73n` |
+| Durable Task Scheduler | `dts-<workload>-<env>-<region>-<token>` | `dts-demofactory-dev-swc-7x73n` (`https://dts-demofactory-c5ftfmf5.swedencentral.durabletask.io`) |
+| Microsoft Foundry & Model | `aif-<workload>-<env>-<region>-<token>` / `proj-*` | `aif-demofactory-dev-swc-7x73n` / `proj-demofactory-dev-swc` (`AppInsights` connection: `appi-demofactory-dev-swc`) / **`orchestrator-model` (`MAI-Thinking-1` `2026-06-01`, `GlobalStandard`)** |
 | Log Analytics & App Insights | `log-*` / `appi-*` | `log-demofactory-dev-swc` / `appi-demofactory-dev-swc` |
+| Public HTTPS Endpoint (`web`) | `https://ca-demofactory-web-dev-swc.<domain>` | `https://ca-demofactory-web-dev-swc.gentledune-e88e6ca9.swedencentral.azurecontainerapps.io` |
 
 ### Live Role Verification
-- Command: `az role assignment list --assignee-object-id 4eec2f7c-5e5b-4966-a544-db9bcc8ee790 --all -o table`
+- Command: `az role assignment list --assignee-object-id dd5f3614-5cea-4399-bacf-734c9e3fe937 --all -o table`
 - Results:
-  - `df-demofact-xfv37byc-uami` → `AcrPull` on `dfxfv37bycacr` ✅
-  - `df-demofact-xfv37byc-uami` → `Key Vault Crypto User` on `df-kv-xfv37byc` ✅
-  - `df-demofact-xfv37byc-uami` → `Storage Blob Data Contributor` on `dfevxfv37bycst` ✅
-  - `df-demofact-xfv37byc-uami` → `Durable Task Data Contributor` on `df-demofact-xfv37byc-dts` ✅
-  - `df-demofact-xfv37byc-uami` → `Foundry User`, `Cognitive Services OpenAI User`, `Cognitive Services User` on `df-demofact-xfv37byc-foundry` ✅
-  - `df-demofact-xfv37byc-uami` → Microsoft Entra SQL Server Administrator (`azureADOnlyAuthentication: true`) on `df-demofact-xfv37byc-sql` ✅
+  - `id-demofactory-dev-swc` → `AcrPull` on `crdemofactorydevswc7x73n` ✅
+  - `id-demofactory-dev-swc` → `Key Vault Crypto User` on `kv-df-dev-swc-7x73n` ✅
+  - `id-demofactory-dev-swc` → `Storage Blob Data Contributor` on `stdfdevswc7x73n` ✅
+  - `id-demofactory-dev-swc` → `Durable Task Data Contributor` on `dts-demofactory-dev-swc-7x73n` ✅
+  - `id-demofactory-dev-swc` → `Foundry User`, `Cognitive Services OpenAI User`, `Cognitive Services User` on `aif-demofactory-dev-swc-7x73n` ✅
+  - `id-demofactory-dev-swc` → Microsoft Entra SQL Server Administrator (`azureADOnlyAuthentication: true`) on `sql-demofactory-dev-swc-7x73n` ✅
+  - `proj-demofactory-dev-swc` → `Monitoring Metrics Publisher` on `appi-demofactory-dev-swc` ✅
 - Status: Pass
 

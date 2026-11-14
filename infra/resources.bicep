@@ -56,6 +56,9 @@ param vnetAddressPrefix string = '10.200.0.0/16'
 @description('Standard WAF Operational Excellence resource tags')
 param tags object = {}
 
+@description('Container image pushed by azd deploy (falls back to public placeholder on initial provision)')
+param webAppImageName string = ''
+
 var uniqueToken = take(uniqueString(subscription().id, resourceGroup().id, environmentName), 5)
 var cleanWorkload = replace(toLower(workloadName), '-', '')
 var cleanShort = replace(toLower(workloadShort), '-', '')
@@ -620,6 +623,35 @@ resource foundryProject 'Microsoft.CognitiveServices/accounts/projects@2025-06-0
   }
 }
 
+resource foundryAppInsightsConnection 'Microsoft.CognitiveServices/accounts/projects/connections@2025-06-01' = {
+  parent: foundryProject
+  name: appInsights.name
+  properties: {
+    category: 'AppInsights'
+    target: appInsights.id
+    authType: 'ApiKey'
+    isSharedToAll: true
+    credentials: {
+      key: appInsights.properties.ConnectionString
+    }
+    metadata: {
+      ApiType: 'Azure'
+      ResourceId: appInsights.id
+    }
+  }
+}
+
+var monitoringMetricsPublisherRoleId = '3913510d-42f4-4e42-8a64-420c390055eb'
+resource foundryProjectMetricsPublisherRoleAssignment 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(appInsights.id, foundryProject.id, monitoringMetricsPublisherRoleId)
+  scope: appInsights
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', monitoringMetricsPublisherRoleId)
+    principalId: foundryProject.identity.principalId
+    principalType: 'ServicePrincipal'
+  }
+}
+
 var foundryProjectEndpoint = 'https://${foundryAccount.name}.services.ai.azure.com/api/projects/${foundryProject.name}'
 
 var cognitiveServicesUserRoleId = 'a97b65f3-24c7-4388-baec-2e87135dc908'
@@ -756,12 +788,32 @@ resource containerAppsEnv 'Microsoft.App/managedEnvironments@2024-03-01' = {
       }
     ]
     appLogsConfiguration: {
-      destination: 'log-analytics'
-      logAnalyticsConfiguration: {
-        customerId: logAnalytics.properties.customerId
-        sharedKey: logAnalytics.listKeys().primarySharedKey
-      }
+      destination: 'azure-monitor'
     }
+  }
+}
+
+resource containerAppsEnvDiagnostics 'Microsoft.Insights/diagnosticSettings@2021-05-01-preview' = {
+  name: 'diag-${containerAppsEnvName}'
+  scope: containerAppsEnv
+  properties: {
+    workspaceId: logAnalytics.id
+    logs: [
+      {
+        category: 'ContainerAppConsoleLogs'
+        enabled: true
+      }
+      {
+        category: 'ContainerAppSystemLogs'
+        enabled: true
+      }
+    ]
+    metrics: [
+      {
+        category: 'AllMetrics'
+        enabled: true
+      }
+    ]
   }
 }
 
@@ -893,7 +945,7 @@ resource webApp 'Microsoft.App/containerApps@2024-03-01' = {
       containers: [
         {
           name: 'web'
-          image: 'mcr.microsoft.com/azuredocs/containerapps-helloworld:latest'
+          image: !empty(webAppImageName) ? webAppImageName : 'mcr.microsoft.com/azuredocs/containerapps-helloworld:latest'
           resources: {
             cpu: json('0.5')
             memory: '1Gi'
@@ -967,3 +1019,5 @@ output DURABLE_TASK_SCHEDULER_ENDPOINT string = scheduler.properties.endpoint
 output FOUNDRY_ENDPOINT string = foundryAccount.properties.endpoint
 output FOUNDRY_PROJECT_ENDPOINT string = foundryProjectEndpoint
 output FOUNDRY_MODEL_DEPLOYMENT string = foundryModelDeployment.name
+output AZURE_APPLICATION_INSIGHTS_RESOURCE_ID string = appInsights.id
+output AZURE_AI_PROJECT_APPINSIGHTS_CONNECTION_NAME string = foundryAppInsightsConnection.name

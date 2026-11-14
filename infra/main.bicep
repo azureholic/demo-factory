@@ -53,6 +53,9 @@ param githubAppId string = '5758548'
 @description('Virtual Network CIDR prefix for Container Apps Environment and Private Endpoints')
 param vnetAddressPrefix string = '10.200.0.0/16'
 
+@description('Container image pushed by azd deploy (preserved across subsequent azd provision runs)')
+param webAppImageName string = ''
+
 var regionAbbreviations = {
   swedencentral: 'swc'
   westeurope: 'weu'
@@ -116,6 +119,7 @@ module resources './resources.bicep' = {
     factoryAppSlug: factoryAppSlug
     githubAppId: githubAppId
     vnetAddressPrefix: vnetAddressPrefix
+    webAppImageName: webAppImageName
     tags: commonTags
   }
 }
@@ -137,4 +141,6 @@ output DURABLE_TASK_SCHEDULER_ENDPOINT string = resources.outputs.DURABLE_TASK_S
 output FOUNDRY_ENDPOINT string = resources.outputs.FOUNDRY_ENDPOINT
 output FOUNDRY_PROJECT_ENDPOINT string = resources.outputs.FOUNDRY_PROJECT_ENDPOINT
 output FOUNDRY_MODEL_DEPLOYMENT string = resources.outputs.FOUNDRY_MODEL_DEPLOYMENT
+output AZURE_APPLICATION_INSIGHTS_RESOURCE_ID string = resources.outputs.AZURE_APPLICATION_INSIGHTS_RESOURCE_ID
+output AZURE_AI_PROJECT_APPINSIGHTS_CONNECTION_NAME string = resources.outputs.AZURE_AI_PROJECT_APPINSIGHTS_CONNECTION_NAME
 
