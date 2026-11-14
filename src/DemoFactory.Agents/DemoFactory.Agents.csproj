@@ -1,0 +1,20 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <ItemGroup>
+    <ProjectReference Include="..\DemoFactory.Domain\DemoFactory.Domain.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Azure.Identity" Version="1.21.0" />
+    <PackageReference Include="JsonSchema.Net" Version="9.6.0" />
+    <PackageReference Include="Microsoft.Agents.AI.DurableTask" Version="1.16.0" />
+    <PackageReference Include="Microsoft.Agents.AI.Foundry" Version="1.28.0-preview.261106.1" />
+  </ItemGroup>
+
+  <PropertyGroup>
+    <TargetFramework>net11.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+</Project>

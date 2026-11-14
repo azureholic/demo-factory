@@ -1,0 +1,24 @@
+name: Deploy Demo Environment
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  id-token: write
+  packages: write
+
+jobs:
+  deploy-demo:
+    runs-on: ubuntu-latest
+    environment: demo
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: azure/login@a457da9ea143d694b1b9c7c869ebb04ebe844ef5
+        with:
+          client-id: ${{ vars.AZURE_DEMO_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      - name: Deploy stable demo Container App (synthetic seed only, zero secrets)
+        run: echo "Deploying demo-${{ github.event.repository.name }} from main@${{ github.sha }}"

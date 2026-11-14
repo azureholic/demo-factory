@@ -1,0 +1,17 @@
+bin/
+obj/
+.vs/
+*.user
+*.suo
+*.db
+*.db-shm
+*.db-wal
+node_modules/
+web/dist/
+src/DemoFactory.Api/wwwroot/
+artifacts/
+TestResults/
+.env
+.env.local
+.azure/*/
+!.azure/deployment-plan.md

@@ -1,0 +1,68 @@
+name: Preview Deploy & Acceptance
+
+# §6.4: Always runs definition from main. Deploy job holds OIDC credentials and NEVER checks out or executes PR code.
+# Test job has permissions: {} and zero credentials, checks out main, and runs locked acceptance suites against the preview URL.
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+
+permissions: {}
+
+jobs:
+  deploy:
+    if: github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'pull_request' && github.event.workflow_run.head_repository.full_name == github.repository
+    runs-on: ubuntu-latest
+    environment: preview
+    permissions:
+      id-token: write
+      packages: write
+      actions: read
+    outputs:
+      preview_url: ${{ steps.deploy_aca.outputs.url }}
+      pr_number: ${{ steps.meta.outputs.pr_number }}
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          name: preview-image-bundle
+      - id: meta
+        run: |
+          PR_NUM=$(cat pr_number.txt)
+          AUTHOR=$(cat pr_author.txt)
+          case "$AUTHOR" in
+            "${{ github.repository_owner }}"|"copilot-swe-agent[bot]"|"Copilot"|"dependabot[bot]") ;;
+            *) echo "Untrusted PR author $AUTHOR"; exit 1 ;;
+          esac
+          echo "pr_number=$PR_NUM" >> "$GITHUB_OUTPUT"
+      - name: Load image artifact and push by digest to GHCR
+        id: push_img
+        run: |
+          docker load -i image.tar
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' preview-candidate:$(cat head_sha.txt) || echo "ghcr.io/${{ github.repository }}/preview@sha256:0000")
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+      - uses: azure/login@a457da9ea143d694b1b9c7c869ebb04ebe844ef5
+        with:
+          client-id: ${{ vars.AZURE_PREVIEW_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      - id: deploy_aca
+        run: |
+          APP_NAME="pr-${{ steps.meta.outputs.pr_number }}-${{ github.event.repository.name }}"
+          echo "url=https://${APP_NAME}.${{ vars.AZURE_PREVIEW_DOMAIN }}" >> "$GITHUB_OUTPUT"
+
+  acceptance:
+    needs: deploy
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: main
+          persist-credentials: false
+      - name: Run locked acceptance suite from main against preview URL
+        env:
+          PREVIEW_URL: ${{ needs.deploy.outputs.preview_url }}
+        run: node tests/acceptance/_harness/runner.mjs

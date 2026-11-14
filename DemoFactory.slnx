@@ -1,0 +1,17 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/DemoFactory.Agents/DemoFactory.Agents.csproj" />
+    <Project Path="src/DemoFactory.Api/DemoFactory.Api.csproj" />
+    <Project Path="src/DemoFactory.AppHost/DemoFactory.AppHost.csproj" />
+    <Project Path="src/DemoFactory.Copilot/DemoFactory.Copilot.csproj" />
+    <Project Path="src/DemoFactory.Domain/DemoFactory.Domain.csproj" />
+    <Project Path="src/DemoFactory.GitHub/DemoFactory.GitHub.csproj" />
+    <Project Path="src/DemoFactory.Infrastructure/DemoFactory.Infrastructure.csproj" />
+    <Project Path="src/DemoFactory.Orchestrator/DemoFactory.Orchestrator.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/DemoFactory.Domain.Tests/DemoFactory.Domain.Tests.csproj" />
+    <Project Path="tests/DemoFactory.E2E/DemoFactory.E2E.csproj" />
+    <Project Path="tests/DemoFactory.Orchestrator.Tests/DemoFactory.Orchestrator.Tests.csproj" />
+  </Folder>
+</Solution>

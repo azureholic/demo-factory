@@ -1,0 +1,33 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Launch Demo-Factory (Lean API + Orchestrator)",
+      "type": "coreclr",
+      "request": "launch",
+      "preLaunchTask": "build-api",
+      "program": "${workspaceFolder}/src/DemoFactory.Api/bin/Debug/net11.0/DemoFactory.Api.dll",
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "ASPNETCORE_ENVIRONMENT": "Development",
+        "ASPNETCORE_URLS": "http://localhost:5180"
+      },
+      "serverReadyAction": {
+        "action": "openExternally",
+        "pattern": "\\bNow listening on:\\s+(https?://\\S+)"
+      }
+    },
+    {
+      "name": "Launch Demo-Factory Aspire AppHost",
+      "type": "coreclr",
+      "request": "launch",
+      "program": "${workspaceFolder}/src/DemoFactory.AppHost/bin/Debug/net11.0/DemoFactory.AppHost.dll",
+      "cwd": "${workspaceFolder}/src/DemoFactory.AppHost",
+      "env": {
+        "ASPNETCORE_ENVIRONMENT": "Development",
+        "DOTNET_ENVIRONMENT": "Development",
+        "ASPIRE_ALLOW_UNSECURED_TRANSPORT": "true"
+      }
+    }
+  ]
+}

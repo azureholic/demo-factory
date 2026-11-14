@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# Protected single entry point for build, lint, and test (§5.2, §10.2)
+set -euo pipefail
+
+MODE="${1:-all}"
+case "$MODE" in
+  build) dotnet build --nologo ;;
+  lint)  dotnet format --verify-no-changes ;;
+  test)  dotnet test --no-build --nologo ;;
+  all)
+    dotnet build --nologo
+    dotnet format --verify-no-changes
+    dotnet test --no-build --nologo
+    ;;
+esac

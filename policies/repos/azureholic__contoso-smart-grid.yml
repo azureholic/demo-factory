@@ -1,0 +1,55 @@
+repository: azureholic/contoso-smart-grid
+project:
+  owner: azureholic
+  number: 7
+autonomy: L1
+wip: 1
+boardPollSeconds: 60
+workLabel: factory
+intake:
+  acceptOutsideIssues: true
+  closeSourceIssuesWhenDone: true
+models:
+  coding: gemini-4-carbon
+  pm: foundry/gpt-4.1-eu
+review:
+  blockingSeverity: Medium
+  maxRounds: 3
+  contestedPolicy:
+    low: allow
+    medium: allow
+    high: block
+gate:
+  requiredChecks:
+    - build
+    - test
+    - lint
+  maxChangedLines: 1500
+  specConformance: true
+acceptanceTests:
+  separateIssueMinSize: Medium
+  maxFixes: 2
+protectedPaths:
+  - ".github/**"
+  - "scripts/**"
+  - "tests/acceptance/_harness/**"
+  - "docs/spec.md"
+  - "docs/features/**"
+  - "CODEOWNERS"
+  - ".editorconfig"
+  - "eslint.config.*"
+  - "**/*.ruleset.json"
+trustedActors:
+  - owner
+  - copilot-swe-agent
+  - copilot-pull-request-reviewer
+  - dependabot
+budget:
+  dailySessions: 40
+  maxSessionsPerItem: 5
+  dailySpendUsd: 25
+  spendPerItemUsd: 5
+riskLabels:
+  - "area:auth"
+  - "area:infra"
+  - "deps"
