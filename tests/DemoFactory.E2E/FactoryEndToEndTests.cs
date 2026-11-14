@@ -5,8 +5,12 @@ using System.Text;
 using System.Text.Json;
 using DemoFactory.Api;
 using DemoFactory.Domain;
+using DemoFactory.GitHub;
+using DemoFactory.Infrastructure;
 using Microsoft.AspNetCore.Mvc.Testing;
+using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.DependencyInjection;
 
 namespace DemoFactory.E2E;
 
@@ -361,6 +365,177 @@ public sealed class FactoryEndToEndTests : IAsyncLifetime
             if (File.Exists(isolatedDb)) { try { File.Delete(isolatedDb); } catch { } }
             if (Directory.Exists(isolatedDir)) { try { Directory.Delete(isolatedDir, recursive: true); } catch { } }
         }
+    }
+
+    [Fact]
+    public async Task EndToEnd_SystemReadiness_ExecutionMode_And_LiveGitHubGatewayFallback()
+    {
+        var isolatedDb = Path.Combine(Path.GetTempPath(), $"demofactory-live-e2e-{Guid.NewGuid():N}.db");
+        var isolatedDir = Path.Combine(Path.GetTempPath(), $"demofactory-live-dir-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(isolatedDir);
+
+        var recordedPaths = new List<string>();
+        var rulesetPostAttempts = 0;
+
+        try
+        {
+            using var liveFactory = new WebApplicationFactory<ApiAssemblyMarker>().WithWebHostBuilder(b =>
+            {
+                b.ConfigureAppConfiguration((_, cfg) =>
+                {
+                    cfg.AddInMemoryCollection(new Dictionary<string, string?>
+                    {
+                        ["ConnectionStrings:Sqlite"] = $"Data Source={isolatedDb}",
+                        ["Factory:SandboxMode"] = "true",
+                        ["Factory:AllowTestHeaderAuth"] = "true",
+                        ["Factory:LocalDataDirectory"] = isolatedDir,
+                        ["Factory:PoliciesDirectory"] = isolatedDir,
+                        ["GitHub:AppId"] = "5758548",
+                        ["GitHub:AppSlug"] = "azureholic-demo-factory",
+                        ["GitHub:ClientId"] = "Iv23liUfMKApH3rhp0J4",
+                        ["GitHub:ClientSecret"] = "test-client-secret",
+                        ["GitHub:WritePaceMilliseconds"] = "1"
+                    });
+                });
+
+                b.ConfigureServices(services =>
+                {
+                    services.AddHttpClient("GitHubApi")
+                        .ConfigurePrimaryHttpMessageHandler(() => new StubGitHubHttpHandler((req) =>
+                        {
+                            var path = $"{req.Method} {req.RequestUri!.AbsolutePath}";
+                            lock (recordedPaths) recordedPaths.Add(path);
+
+                            // Simulate missing template repo -> triggers direct POST /user/repos fallback
+                            if (req.Method == HttpMethod.Get && req.RequestUri.AbsolutePath.Contains("demo-factory-template", StringComparison.OrdinalIgnoreCase))
+                                return StubJson(HttpStatusCode.NotFound, new { message = "Not Found" });
+
+                            if (req.Method == HttpMethod.Get && req.RequestUri.AbsolutePath == "/repos/azureholic/live-test-repo")
+                            {
+                                var createdAlready = recordedPaths.Any(p => p == "POST /user/repos");
+                                return createdAlready
+                                    ? StubJson(HttpStatusCode.OK, new { name = "live-test-repo", default_branch = "main", allow_auto_merge = true, allow_squash_merge = true })
+                                    : StubJson(HttpStatusCode.NotFound, new { message = "Not Found" });
+                            }
+
+                            if (req.Method == HttpMethod.Get && req.RequestUri.AbsolutePath == "/user")
+                                return StubJson(HttpStatusCode.OK, new { login = "azureholic" });
+
+                            if (req.Method == HttpMethod.Post && req.RequestUri.AbsolutePath == "/user/repos")
+                                return StubJson(HttpStatusCode.Created, new { name = "live-test-repo", default_branch = "main" });
+
+                            if (req.Method == HttpMethod.Get && req.RequestUri.AbsolutePath.Contains("/git/ref/heads/", StringComparison.Ordinal))
+                                return StubJson(HttpStatusCode.OK, new { @object = new { sha = "abc123def456" } });
+
+                            if (req.Method == HttpMethod.Get && req.RequestUri.AbsolutePath.Contains("/contents/", StringComparison.Ordinal))
+                                return StubJson(HttpStatusCode.NotFound, new { message = "Not Found" });
+
+                            if (req.Method == HttpMethod.Put && req.RequestUri.AbsolutePath.Contains("/contents/", StringComparison.Ordinal))
+                                return StubJson(HttpStatusCode.Created, new { content = new { sha = "file_sha_1" } });
+
+                            if (req.Method == HttpMethod.Get && req.RequestUri.AbsolutePath.EndsWith("/rulesets", StringComparison.Ordinal))
+                                return StubJson(HttpStatusCode.OK, Array.Empty<object>());
+
+                            // First ruleset POST returns 422 (simulating plan restriction on copilot_code_review/code_scanning) -> second succeeds!
+                            if (req.Method == HttpMethod.Post && req.RequestUri.AbsolutePath.EndsWith("/rulesets", StringComparison.Ordinal))
+                            {
+                                return Interlocked.Increment(ref rulesetPostAttempts) == 1
+                                    ? StubJson(HttpStatusCode.UnprocessableEntity, new { message = "Rule not supported on plan" })
+                                    : StubJson(HttpStatusCode.Created, new { id = 101, name = "demo-factory-main-protection" });
+                            }
+
+                            if (req.Method == HttpMethod.Post && req.RequestUri.AbsolutePath == "/graphql")
+                            {
+                                var bodyText = req.Content!.ReadAsStringAsync().GetAwaiter().GetResult();
+                                if (bodyText.Contains("ResolveRepoAndOwner", StringComparison.Ordinal))
+                                    return StubJson(HttpStatusCode.OK, new { data = new { repository = new { id = "R_kgDO1", owner = new { id = "U_kgDO1" } } } });
+                                if (bodyText.Contains("createProjectV2", StringComparison.Ordinal))
+                                    return StubJson(HttpStatusCode.OK, new { data = new { createProjectV2 = new { projectV2 = new { id = "PVT_live_99", number = 7 } } } });
+                                if (bodyText.Contains("linkProjectV2ToRepository", StringComparison.Ordinal))
+                                    return StubJson(HttpStatusCode.OK, new { data = new { linkProjectV2ToRepository = new { repository = new { id = "R_kgDO1" } } } });
+                                if (bodyText.Contains("addProjectV2ItemById", StringComparison.Ordinal))
+                                    return StubJson(HttpStatusCode.OK, new { data = new { addProjectV2ItemById = new { item = new { id = "PVTI_live_1" } } } });
+                                return StubJson(HttpStatusCode.OK, new { data = new { } });
+                            }
+
+                            if (req.Method == HttpMethod.Get && req.RequestUri.AbsolutePath.Contains("/labels/", StringComparison.Ordinal))
+                                return StubJson(HttpStatusCode.NotFound, new { message = "Not Found" });
+
+                            if (req.Method == HttpMethod.Post && req.RequestUri.AbsolutePath.EndsWith("/issues", StringComparison.Ordinal))
+                                return StubJson(HttpStatusCode.Created, new { number = 1, node_id = "I_live_1", html_url = "https://github.com/azureholic/live-test-repo/issues/1" });
+
+                            return StubJson(HttpStatusCode.OK, new { ok = true });
+                        }));
+                });
+            });
+
+            using var client = liveFactory.CreateClient();
+
+            // 1. /api/system/readiness reports Sandbox mode + seeded Sandbox token -> switching to Live without Force is rejected
+            var readiness = await client.GetFromJsonAsync<JsonElement>("/api/system/readiness");
+            Assert.True(readiness.GetProperty("sandboxMode").GetBoolean());
+            Assert.Equal("azureholic-demo-factory", readiness.GetProperty("gitHub").GetProperty("appSlug").GetString());
+            Assert.Equal("Sandbox", readiness.GetProperty("gitHub").GetProperty("tokenKind").GetString());
+
+            var blockedSwitch = await client.PostAsJsonAsync("/api/system/mode", new { sandboxMode = false, force = false });
+            Assert.Equal(HttpStatusCode.BadRequest, blockedSwitch.StatusCode);
+
+            // 2. Store a real GitHub user token via ITokenBroker, then switch to Live GitHub mode
+            var broker = liveFactory.Services.GetRequiredService<ITokenBroker>();
+            await broker.StoreRotatedTokensAsync("azureholic", "ghu_real_live_token", TimeSpan.FromHours(8), "ghr_real_live_refresh", TimeSpan.FromDays(90));
+
+            var liveSwitch = await client.PostAsJsonAsync("/api/system/mode", new { sandboxMode = false });
+            Assert.Equal(HttpStatusCode.OK, liveSwitch.StatusCode);
+            Assert.True(File.Exists(Path.Combine(isolatedDir, "runtime-mode.json")));
+
+            var statusAfter = await client.GetFromJsonAsync<JsonElement>("/api/factory/status");
+            Assert.False(statusAfter.GetProperty("sandboxMode").GetBoolean());
+
+            // 3. Exercise live GitHubGateway fallback repo creation, ruleset fallback, createProjectV2, and issue creation
+            var gateway = liveFactory.Services.GetRequiredService<IGitHubGateway>();
+            var dbFactory = liveFactory.Services.GetRequiredService<IDbContextFactory<DemoFactoryDbContext>>();
+            await using (var db = await dbFactory.CreateDbContextAsync())
+            {
+                var p = new ProjectEntity { Name = "Live Test", Slug = "live-test-repo", SpecMarkdown = "# Spec" };
+                db.Projects.Add(p);
+                db.Repositories.Add(new RepositoryEntity { ProjectId = p.Id, Owner = "azureholic", Name = "live-test-repo", InstallationId = 0 });
+                await db.SaveChangesAsync();
+            }
+
+            var repoUrl = await gateway.CreateRepositoryFromTemplateAsync(
+                "azureholic", "demo-factory-template-dotnet-react", "azureholic", "live-test-repo", true, "# Spec", "# ADR");
+            Assert.Equal("https://github.com/azureholic/live-test-repo", repoUrl);
+            Assert.Contains("POST /user/repos", recordedPaths);
+            Assert.Contains("PUT /repos/azureholic/live-test-repo/contents/docs/spec.md", recordedPaths);
+
+            await gateway.ApplyRulesetsAndSettingsAsync("azureholic", "live-test-repo", ["build", "test", "lint"]);
+            Assert.Equal(2, rulesetPostAttempts);
+
+            var (projId, projNum) = await gateway.CopyProjectBoardAsync("azureholic", "live-test-repo", "Live Test Board");
+            Assert.Equal("PVT_live_99", projId);
+            Assert.Equal(7, projNum);
+
+            var issue = await gateway.CreateIssueAsync("azureholic", "live-test-repo", "Walking skeleton", "Body", ["factory"]);
+            Assert.Equal(1, issue.Number);
+            Assert.Contains("POST /repos/azureholic/live-test-repo/labels", recordedPaths);
+        }
+        finally
+        {
+            if (File.Exists(isolatedDb)) { try { File.Delete(isolatedDb); } catch { } }
+            if (Directory.Exists(isolatedDir)) { try { Directory.Delete(isolatedDir, recursive: true); } catch { } }
+        }
+    }
+
+    private static HttpResponseMessage StubJson(HttpStatusCode code, object payload) =>
+        new(code)
+        {
+            Content = new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json")
+        };
+
+    private sealed class StubGitHubHttpHandler(Func<HttpRequestMessage, HttpResponseMessage> responder) : HttpMessageHandler
+    {
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken) =>
+            Task.FromResult(responder(request));
     }
 
     private Task<HttpResponseMessage> SendSignedWebhookAsync(string eventType, string deliveryId, string jsonBody)

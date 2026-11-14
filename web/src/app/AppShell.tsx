@@ -278,6 +278,15 @@ const AuthenticatedWorkspace: React.FC<{
           <Badge appearance="outline" color={connected ? 'success' : 'informative'}>
             {connected ? 'Live' : 'Polling'}
           </Badge>
+          <Badge
+            appearance="tint"
+            color={statusQuery.data?.sandboxMode === false ? 'brand' : 'warning'}
+            style={{ cursor: 'pointer' }}
+            title="Click to configure Sandbox vs Live GitHub execution mode"
+            onClick={() => navigate('/policies')}
+          >
+            {statusQuery.data?.sandboxMode === false ? 'Live GitHub' : 'Sandbox Mode'}
+          </Badge>
 
           {repos.length > 0 && (
             <Dropdown

@@ -1,5 +1,6 @@
 using System.Text;
 using System.Text.Json;
+using DemoFactory.Agents;
 using DemoFactory.Copilot;
 using DemoFactory.Domain;
 using DemoFactory.GitHub;
@@ -41,6 +42,10 @@ public sealed record UpsertModelCatalogueRequest(
     string ApiModelId,
     bool Enabled,
     string? Notes);
+
+public sealed record SetExecutionModeRequest(
+    bool SandboxMode,
+    bool Force = false);
 
 public static class OperationsAndGovernanceEndpoints
 {
@@ -1000,10 +1005,94 @@ public static class OperationsAndGovernanceEndpoints
                 globalPaused = global?.GlobalPaused ?? false,
                 anyLineStopped,
                 reconnectRequired = conn.ReconnectRequired,
+                sandboxMode = envOptions.Value.GetEffectiveSandboxMode(),
                 profile = envOptions.Value.Profile.ToString(),
                 ownerLogin = envOptions.Value.OwnerLogin
             });
         });
+
+        app.MapGet("/api/system/readiness", async (
+            ITokenBroker tokenBroker,
+            IGitHubGateway gitHub,
+            IOptions<FactoryEnvironmentOptions> envOptions,
+            IOptions<FoundryAgentOptions> foundryOptions,
+            CancellationToken ct) =>
+        {
+            tokenBroker.EnsureConfigurationLoaded();
+            var owner = envOptions.Value.OwnerLogin;
+            var conn = await tokenBroker.GetConnectionStatusAsync(owner, ct);
+            var appInstallation = await gitHub.CheckAppInstallationAsync(owner, ct: ct);
+            var foundryEndpoint = foundryOptions.Value.ProjectEndpoint ?? string.Empty;
+            var foundryConfigured = !string.IsNullOrWhiteSpace(foundryEndpoint) && Uri.TryCreate(foundryEndpoint, UriKind.Absolute, out _);
+
+            return Results.Ok(new
+            {
+                sandboxMode = envOptions.Value.GetEffectiveSandboxMode(),
+                ownerLogin = owner,
+                gitHub = new
+                {
+                    oauthConfigured = tokenBroker.IsGitHubOAuthConfigured,
+                    privateKeyConfigured = tokenBroker.HasPrivateKeyConfigured,
+                    appId = tokenBroker.ActiveAppId,
+                    appSlug = tokenBroker.ActiveAppSlug,
+                    clientId = tokenBroker.IsGitHubOAuthConfigured ? tokenBroker.ActiveClientId : string.Empty,
+                    delegatedTokenConnected = conn.Connected,
+                    tokenKind = conn.TokenKind,
+                    reconnectRequired = conn.ReconnectRequired,
+                    appInstallation
+                },
+                foundry = new
+                {
+                    configured = foundryConfigured,
+                    projectEndpoint = foundryEndpoint,
+                    deployment = foundryOptions.Value.DefaultDeployment,
+                    region = foundryOptions.Value.Region
+                }
+            });
+        }).RequireAuthorization(FactoryRoles.ViewerPolicy);
+
+        app.MapPost("/api/system/mode", async (
+            SetExecutionModeRequest req,
+            HttpContext http,
+            ITokenBroker tokenBroker,
+            IOptions<FactoryEnvironmentOptions> envOptions,
+            IAuditLogger auditLogger,
+            CancellationToken ct) =>
+        {
+            tokenBroker.EnsureConfigurationLoaded();
+            var owner = envOptions.Value.OwnerLogin;
+            var conn = await tokenBroker.GetConnectionStatusAsync(owner, ct);
+
+            if (!req.SandboxMode && !req.Force)
+            {
+                if (!tokenBroker.IsGitHubOAuthConfigured)
+                {
+                    return Results.BadRequest(new { error = "GitHub App OAuth credentials are not configured yet." });
+                }
+
+                if (!conn.Connected || !string.Equals(conn.TokenKind, "GitHub", StringComparison.OrdinalIgnoreCase))
+                {
+                    return Results.BadRequest(new { error = "Sign in with your real GitHub account ('Reconnect GitHub') before switching to Live GitHub mode." });
+                }
+            }
+
+            var before = envOptions.Value.GetEffectiveSandboxMode();
+            await envOptions.Value.SetEffectiveSandboxModeAsync(req.SandboxMode, ct);
+            var actor = http.User.Identity?.Name ?? "admin";
+            await auditLogger.RecordAsync(
+                actor,
+                "ExecutionModeUpdated",
+                "Factory",
+                "execution-mode",
+                before: new { sandboxMode = before },
+                after: new { sandboxMode = req.SandboxMode },
+                ct: ct);
+
+            return Results.Ok(new
+            {
+                sandboxMode = envOptions.Value.GetEffectiveSandboxMode()
+            });
+        }).RequireAuthorization(FactoryRoles.AdminPolicy);
 
         app.MapPost("/api/factory:pause", async (
             Guid? repo,

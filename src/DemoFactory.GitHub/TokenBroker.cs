@@ -28,6 +28,7 @@ public sealed class GitHubAppOptions
     public string KeyVaultSigningKeyId { get; set; } = string.Empty;
     public string KeyVaultWrapKeyId { get; set; } = string.Empty;
     public string PrivateKeyPem { get; set; } = string.Empty;
+    public string TemplateProjectNodeId { get; set; } = string.Empty;
     public string LocalEncryptionPassphrase { get; set; } = "demo-factory-local-dev-key-material-32b!";
     public string ManagedIdentityClientId { get; set; } = string.Empty;
     public int WritePaceMilliseconds { get; set; } = 1000;
@@ -194,7 +195,8 @@ public sealed record DelegatedTokenStatus(
     bool IsRevoked,
     DateTimeOffset? AccessTokenExpiresAt,
     DateTimeOffset? RefreshTokenExpiresAt,
-    bool ReconnectRequired);
+    bool ReconnectRequired,
+    string TokenKind = "None");
 
 public sealed record GitHubOAuthSessionResult(
     string Login,
@@ -204,8 +206,11 @@ public sealed record GitHubOAuthSessionResult(
 public interface ITokenBroker
 {
     bool IsGitHubOAuthConfigured { get; }
+    bool HasPrivateKeyConfigured { get; }
+    string ActiveAppId { get; }
     string ActiveClientId { get; }
     string ActiveAppSlug { get; }
+    void EnsureConfigurationLoaded();
     string BuildAuthorizeUrl(string state, string? redirectUriOverride = null);
     Task ConfigureGitHubCredentialsAsync(string clientId, string clientSecret, string? appId = null, string? appSlug = null, string? webhookSecret = null, string? privateKeyPem = null, CancellationToken ct = default);
     Task<string> CompleteManifestConversionAsync(string manifestCode, CancellationToken ct = default);
@@ -277,8 +282,15 @@ public sealed class TokenBroker : ITokenBroker
         && !_appOptions.ClientId.Equals("Iv23liDemoFactoryLocal", StringComparison.OrdinalIgnoreCase)
         && !string.IsNullOrWhiteSpace(_appOptions.ClientSecret);
 
+    public bool HasPrivateKeyConfigured =>
+        !string.IsNullOrWhiteSpace(_appOptions.PrivateKeyPem)
+        || !string.IsNullOrWhiteSpace(_appOptions.KeyVaultSigningKeyId);
+
+    public string ActiveAppId => _appOptions.AppId;
     public string ActiveClientId => _appOptions.ClientId;
     public string ActiveAppSlug => _appOptions.AppSlug;
+
+    public void EnsureConfigurationLoaded() => TryLoadPersistedOAuthConfig();
 
     public string BuildAuthorizeUrl(string state, string? redirectUriOverride = null)
     {
@@ -494,6 +506,25 @@ public sealed class TokenBroker : ITokenBroker
                 return nonExpiringToken;
             }
 
+            if (IsSandboxRefreshToken(refreshToken))
+            {
+                if (_envOptions.GetEffectiveSandboxMode())
+                {
+                    var sandboxAccess = $"ghu_sandbox_{Guid.NewGuid():N}";
+                    var sandboxRefresh = $"ghr_sandbox_{Guid.NewGuid():N}";
+                    await PersistRefreshFirstThenSwapMemoryAsync(
+                        gitHubLogin,
+                        sandboxAccess,
+                        TimeSpan.FromHours(8),
+                        sandboxRefresh,
+                        TimeSpan.FromDays(180),
+                        ct);
+                    return sandboxAccess;
+                }
+
+                throw new InvalidOperationException("Current session uses a local sandbox token. Click 'Reconnect GitHub' to sign in with your real GitHub account before running in Live GitHub mode.");
+            }
+
             TryLoadPersistedOAuthConfig();
             if (!IsGitHubOAuthConfigured)
             {
@@ -570,14 +601,31 @@ public sealed class TokenBroker : ITokenBroker
 
         var expired = record.RefreshTokenExpiresAt <= DateTimeOffset.UtcNow;
         var reconnect = record.IsRevoked || expired;
+        var tokenKind = "GitHub";
+        try
+        {
+            var decrypted = await _protector.DecryptRefreshTokenAsync(record.EncryptedRefreshToken, ct);
+            if (IsSandboxRefreshToken(decrypted))
+                tokenKind = "Sandbox";
+        }
+        catch
+        {
+            tokenKind = "Unknown";
+        }
+
         return new DelegatedTokenStatus(
             gitHubLogin,
             Connected: !reconnect,
             IsRevoked: record.IsRevoked,
             AccessTokenExpiresAt: record.AccessTokenExpiresAt,
             RefreshTokenExpiresAt: record.RefreshTokenExpiresAt,
-            ReconnectRequired: reconnect);
+            ReconnectRequired: reconnect,
+            TokenKind: reconnect ? "None" : tokenKind);
     }
+
+    private static bool IsSandboxRefreshToken(string value) =>
+        value.StartsWith("ghr_sandbox_", StringComparison.Ordinal)
+        || value.Contains("sandbox-refresh-token", StringComparison.OrdinalIgnoreCase);
 
     public async Task StoreRotatedTokensAsync(
         string gitHubLogin,

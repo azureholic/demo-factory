@@ -5,6 +5,8 @@ import {
   Card,
   Dropdown,
   Input,
+  MessageBar,
+  MessageBarBody,
   Option,
   Switch,
   Text,
@@ -18,8 +20,10 @@ export const PoliciesPage: React.FC<{ repoId?: string }> = ({ repoId }) => {
   const qc = useQueryClient();
   const [newModelId, setNewModelId] = useState('');
   const [newModelDisplay, setNewModelDisplay] = useState('');
+  const [modeError, setModeError] = useState<string | null>(null);
 
   const meQuery = useQuery({ queryKey: ['me'], queryFn: api.getMe });
+  const readinessQuery = useQuery({ queryKey: ['systemReadiness'], queryFn: api.getSystemReadiness });
   const modelsQuery = useQuery({ queryKey: ['models'], queryFn: api.getModels });
   const settingsQuery = useQuery({ queryKey: ['settings'], queryFn: api.getSettings });
   const repoSettingsQuery = useQuery({
@@ -60,6 +64,19 @@ export const PoliciesPage: React.FC<{ repoId?: string }> = ({ repoId }) => {
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['me'] });
       qc.invalidateQueries({ queryKey: ['factoryStatus'] });
+      qc.invalidateQueries({ queryKey: ['systemReadiness'] });
+    }
+  });
+
+  const toggleModeMutation = useMutation({
+    mutationFn: (sandboxMode: boolean) => api.setExecutionMode(sandboxMode),
+    onSuccess: () => {
+      setModeError(null);
+      qc.invalidateQueries({ queryKey: ['systemReadiness'] });
+      qc.invalidateQueries({ queryKey: ['factoryStatus'] });
+    },
+    onError: (err: any) => {
+      setModeError(err instanceof Error ? err.message : String(err));
     }
   });
 
@@ -173,23 +190,95 @@ export const PoliciesPage: React.FC<{ repoId?: string }> = ({ repoId }) => {
           <Text size={200}>
             Signed-in Account: <strong>@{me?.login}</strong> ({me?.role}) · Plan: <strong>{me?.copilotPlan}</strong>
           </Text>
-          <Text size={200}>
-            Status:{' '}
+          <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+            <Text size={200}>Token:</Text>
             <Badge appearance="filled" color={me?.connection.connected ? 'success' : 'danger'}>
-              {me?.connection.connected ? 'Delegated Token Active' : 'Reconnect Required'}
+              {me?.connection.connected
+                ? `Active (${readinessQuery.data?.gitHub.tokenKind ?? 'GitHub'})`
+                : 'Reconnect Required'}
             </Badge>
-          </Text>
-          {me?.connection.refreshTokenExpiresAt && (
+            <Text size={200}>App Installation:</Text>
+            <Badge
+              appearance="tint"
+              color={readinessQuery.data?.gitHub.appInstallation.installedOnOwner ? 'success' : 'warning'}
+            >
+              {readinessQuery.data?.gitHub.appInstallation.installedOnOwner
+                ? `Installed (#${readinessQuery.data.gitHub.appInstallation.installationId})`
+                : 'Not Installed on Account'}
+            </Badge>
+            <Text size={200}>PM Agent:</Text>
+            <Badge appearance="tint" color={readinessQuery.data?.foundry.configured ? 'brand' : 'informative'}>
+              {readinessQuery.data?.foundry.configured ? 'Live Foundry' : 'Local Fallback'}
+            </Badge>
+          </div>
+          {readinessQuery.data?.gitHub.appInstallation.detail && (
             <Text size={200} style={{ color: tokens.colorNeutralForeground3 }}>
-              Refresh token expires: {new Date(me.connection.refreshTokenExpiresAt).toLocaleDateString()} (encrypted with Key Vault key)
+              {readinessQuery.data.gitHub.appInstallation.detail}
             </Text>
           )}
-          <div style={{ display: 'flex', gap: 8 }}>
+          {me?.connection.refreshTokenExpiresAt && (
+            <Text size={200} style={{ color: tokens.colorNeutralForeground3 }}>
+              Refresh token expires: {new Date(me.connection.refreshTokenExpiresAt).toLocaleDateString()} (encrypted locally / Key Vault)
+            </Text>
+          )}
+
+          {me?.role === 'Admin' && readinessQuery.data && (
+            <div
+              style={{
+                padding: 10,
+                borderRadius: 6,
+                background: tokens.colorNeutralBackground2,
+                display: 'flex',
+                justifyContent: 'space-between',
+                alignItems: 'center',
+                gap: 12
+              }}
+            >
+              <div>
+                <Text weight="semibold" block>
+                  Live GitHub API Execution
+                </Text>
+                <Text size={200} style={{ color: tokens.colorNeutralForeground3 }}>
+                  {readinessQuery.data.sandboxMode
+                    ? 'Sandbox Mode active — repositories, issues, and PRs are simulated locally.'
+                    : 'Live GitHub Mode active — creates real repositories, rulesets, issues, and Copilot sessions on GitHub.'}
+                </Text>
+              </div>
+              <Switch
+                checked={!readinessQuery.data.sandboxMode}
+                disabled={toggleModeMutation.isPending}
+                onChange={(_, d) => toggleModeMutation.mutate(!d.checked)}
+              />
+            </div>
+          )}
+
+          {modeError && (
+            <MessageBar intent="error">
+              <MessageBarBody>{modeError}</MessageBarBody>
+            </MessageBar>
+          )}
+
+          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+            {readinessQuery.data?.gitHub.appInstallation &&
+              !readinessQuery.data.gitHub.appInstallation.installedOnOwner && (
+                <Button
+                  appearance="primary"
+                  as="a"
+                  href={readinessQuery.data.gitHub.appInstallation.installUrl}
+                  target="_blank"
+                  rel="noreferrer"
+                >
+                  Install App on GitHub
+                </Button>
+              )}
             <Button appearance="secondary" as="a" href="/auth/github/login">
               Reconnect GitHub
             </Button>
+            <Button appearance="outline" onClick={() => readinessQuery.refetch()}>
+              Recheck Readiness
+            </Button>
             <Button appearance="subtle" onClick={() => revokeMutation.mutate()}>
-              Revoke Token & Pause Factory
+              Revoke Token &amp; Pause Factory
             </Button>
           </div>
         </Card>

@@ -9,6 +9,7 @@ Directory.CreateDirectory(localDataDir);
 var sharedSqlitePath = Path.Combine(localDataDir, "demofactory-aspire.db");
 var sharedSqliteConn = $"Data Source={sharedSqlitePath};Cache=Shared";
 var policiesDir = Path.Combine(repoRoot, "policies", "repos");
+var templatesDir = Path.Combine(repoRoot, "templates");
 var evidenceDir = Path.Combine(localDataDir, "evidence");
 var promptsDir = Path.Combine(repoRoot, "agents", "pm");
 
@@ -21,6 +22,7 @@ var api = builder.AddProject<Projects.DemoFactory_Api>("factory-api")
     .WithEnvironment("Factory__RegisterBackgroundWorkers", "false")
     .WithEnvironment("Factory__LocalDataDirectory", localDataDir)
     .WithEnvironment("Factory__PoliciesDirectory", policiesDir)
+    .WithEnvironment("Factory__TemplatesDirectory", templatesDir)
     .WithEnvironment("Factory__EvidenceLocalDirectory", evidenceDir)
     .WithEnvironment("Factory__FrontendDevUrl", "http://localhost:5173")
     .WithEnvironment("Foundry__PromptsDirectory", promptsDir)
@@ -32,6 +34,7 @@ var orchestrator = builder.AddProject<Projects.DemoFactory_Orchestrator>("factor
     .WithEnvironment("ConnectionStrings__Sqlite", sharedSqliteConn)
     .WithEnvironment("Factory__LocalDataDirectory", localDataDir)
     .WithEnvironment("Factory__PoliciesDirectory", policiesDir)
+    .WithEnvironment("Factory__TemplatesDirectory", templatesDir)
     .WithEnvironment("Factory__EvidenceLocalDirectory", evidenceDir)
     .WithEnvironment("Foundry__PromptsDirectory", promptsDir);
 

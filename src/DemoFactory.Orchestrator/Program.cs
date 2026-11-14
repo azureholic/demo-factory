@@ -20,6 +20,13 @@ using (var scope = host.Services.CreateScope())
 {
     var dbFactory = scope.ServiceProvider.GetRequiredService<IDbContextFactory<DemoFactoryDbContext>>();
     var envOpts = scope.ServiceProvider.GetRequiredService<IOptions<FactoryEnvironmentOptions>>().Value;
+    if (!envOpts.AllowTestHeaderAuth && string.IsNullOrWhiteSpace(envOpts.LocalDataDirectory))
+    {
+        envOpts.LocalDataDirectory = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "DemoFactory");
+    }
+
     await DemoFactorySeeder.EnsureSeededAsync(dbFactory, envOpts.OwnerLogin, seedDemoData: false);
 }
 

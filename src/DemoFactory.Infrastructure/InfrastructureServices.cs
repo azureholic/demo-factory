@@ -28,8 +28,63 @@ public sealed class FactoryEnvironmentOptions
     public string PreviewsResourceGroup { get; set; } = "rg-demo-factory-previews";
     public string ManagedIdentityClientId { get; set; } = string.Empty;
     public string LocalDataDirectory { get; set; } = string.Empty;
+    public string TemplatesDirectory { get; set; } = "templates";
     public bool SandboxMode { get; set; } = true;
     public bool AllowTestHeaderAuth { get; set; } = false;
+
+    private DateTime _cachedModeFileWriteUtc = DateTime.MinValue;
+    private bool? _cachedRuntimeSandboxMode;
+
+    public bool GetEffectiveSandboxMode()
+    {
+        if (string.IsNullOrWhiteSpace(LocalDataDirectory))
+            return SandboxMode;
+
+        try
+        {
+            var modePath = Path.Combine(LocalDataDirectory, "runtime-mode.json");
+            if (!File.Exists(modePath))
+            {
+                _cachedRuntimeSandboxMode = null;
+                return SandboxMode;
+            }
+
+            var lastWrite = File.GetLastWriteTimeUtc(modePath);
+            if (_cachedRuntimeSandboxMode.HasValue && lastWrite == _cachedModeFileWriteUtc)
+                return _cachedRuntimeSandboxMode.Value;
+
+            using var doc = JsonDocument.Parse(File.ReadAllText(modePath));
+            if (doc.RootElement.TryGetProperty("sandboxMode", out var prop) && prop.ValueKind is JsonValueKind.True or JsonValueKind.False)
+            {
+                var val = prop.GetBoolean();
+                _cachedModeFileWriteUtc = lastWrite;
+                _cachedRuntimeSandboxMode = val;
+                SandboxMode = val;
+                return val;
+            }
+        }
+        catch
+        {
+            // Fall back to configured in-memory value
+        }
+
+        return SandboxMode;
+    }
+
+    public async Task SetEffectiveSandboxModeAsync(bool sandboxMode, CancellationToken ct = default)
+    {
+        SandboxMode = sandboxMode;
+        _cachedRuntimeSandboxMode = sandboxMode;
+
+        if (!string.IsNullOrWhiteSpace(LocalDataDirectory))
+        {
+            Directory.CreateDirectory(LocalDataDirectory);
+            var modePath = Path.Combine(LocalDataDirectory, "runtime-mode.json");
+            var json = JsonSerializer.Serialize(new { sandboxMode, updatedAt = DateTimeOffset.UtcNow });
+            await File.WriteAllTextAsync(modePath, json, Encoding.UTF8, ct);
+            _cachedModeFileWriteUtc = File.GetLastWriteTimeUtc(modePath);
+        }
+    }
 }
 
 public interface IEvidenceStore
@@ -357,7 +412,7 @@ public sealed class PreviewHostingService(
 {
     public async Task DeletePreviewAppAsync(PreviewEnvironmentEntity preview, string actor, CancellationToken ct = default)
     {
-        if (!options.Value.SandboxMode
+        if (!options.Value.GetEffectiveSandboxMode()
             && !string.IsNullOrWhiteSpace(options.Value.PreviewsSubscriptionId))
         {
             TokenCredential credential = string.IsNullOrWhiteSpace(options.Value.ManagedIdentityClientId)

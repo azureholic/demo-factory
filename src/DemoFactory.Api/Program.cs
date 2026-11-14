@@ -75,7 +75,15 @@ using (var scope = app.Services.CreateScope())
 {
     var dbFactory = scope.ServiceProvider.GetRequiredService<IDbContextFactory<DemoFactoryDbContext>>();
     var envOpts = scope.ServiceProvider.GetRequiredService<IOptions<FactoryEnvironmentOptions>>().Value;
-    var seedDemo = builder.Configuration.GetValue("Factory:SeedDemoData", envOpts.SandboxMode);
+    if (!envOpts.AllowTestHeaderAuth && string.IsNullOrWhiteSpace(envOpts.LocalDataDirectory))
+    {
+        envOpts.LocalDataDirectory = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "DemoFactory");
+    }
+
+    var effectiveSandbox = envOpts.GetEffectiveSandboxMode();
+    var seedDemo = effectiveSandbox && builder.Configuration.GetValue("Factory:SeedDemoData", true);
     await DemoFactorySeeder.EnsureSeededAsync(dbFactory, envOpts.OwnerLogin, seedDemo);
 }
 

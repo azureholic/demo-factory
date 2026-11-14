@@ -31,8 +31,16 @@ public sealed record CreatedIssueRef(
     string NodeId,
     string HtmlUrl);
 
+public sealed record AppInstallationCheckResult(
+    bool CheckedLive,
+    bool InstalledOnOwner,
+    long? InstallationId,
+    string InstallUrl,
+    string Detail);
+
 public interface IGitHubGateway
 {
+    Task<AppInstallationCheckResult> CheckAppInstallationAsync(string owner, string? repo = null, CancellationToken ct = default);
     Task<string> CreateRepositoryFromTemplateAsync(string templateOwner, string templateRepo, string newOwner, string newRepo, bool isPublic, string specMarkdown, string adrMarkdown, CancellationToken ct = default);
     Task ApplySecurityBaselineAsync(string owner, string repo, bool isPublic, CancellationToken ct = default);
     Task ApplyRulesetsAndSettingsAsync(string owner, string repo, IReadOnlyList<string> requiredChecks, CancellationToken ct = default);
@@ -75,6 +83,93 @@ public sealed class GitHubGateway(
     private int _sandboxNextIssueNumber = 20;
     private int _sandboxNextPrNumber = 200;
 
+    private bool IsSandbox => envOptions.Value.GetEffectiveSandboxMode();
+
+    public async Task<AppInstallationCheckResult> CheckAppInstallationAsync(string owner, string? repo = null, CancellationToken ct = default)
+    {
+        tokenBroker.EnsureConfigurationLoaded();
+        var slug = string.IsNullOrWhiteSpace(tokenBroker.ActiveAppSlug) ? appOptions.Value.AppSlug : tokenBroker.ActiveAppSlug;
+        var installUrl = $"https://github.com/apps/{Uri.EscapeDataString(slug)}/installations/new";
+
+        if (!tokenBroker.HasPrivateKeyConfigured)
+        {
+            return new AppInstallationCheckResult(
+                CheckedLive: false,
+                InstalledOnOwner: false,
+                InstallationId: null,
+                InstallUrl: installUrl,
+                Detail: "GitHub App private key is not stored locally yet.");
+        }
+
+        try
+        {
+            var appJwt = await jwtSigner.CreateAppJwtAsync(ct);
+            using var http = httpClientFactory.CreateClient("GitHubApi");
+
+            if (!string.IsNullOrWhiteSpace(repo))
+            {
+                using var repoReq = new HttpRequestMessage(HttpMethod.Get, $"https://api.github.com/repos/{owner}/{repo}/installation");
+                repoReq.Headers.Authorization = new AuthenticationHeaderValue("Bearer", appJwt);
+                repoReq.Headers.UserAgent.ParseAdd("Demo-Factory/0.8");
+                repoReq.Headers.Accept.ParseAdd("application/vnd.github+json");
+                using var repoResp = await http.SendAsync(repoReq, ct);
+                if (repoResp.IsSuccessStatusCode)
+                {
+                    using var repoDoc = await JsonDocument.ParseAsync(await repoResp.Content.ReadAsStreamAsync(ct), cancellationToken: ct);
+                    if (repoDoc.RootElement.TryGetProperty("id", out var repoInstId))
+                    {
+                        var id = repoInstId.GetInt64();
+                        return new AppInstallationCheckResult(true, true, id, installUrl, $"Installed on {owner}/{repo} (installation #{id}).");
+                    }
+                }
+            }
+
+            using var req = new HttpRequestMessage(HttpMethod.Get, "https://api.github.com/app/installations?per_page=100");
+            req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", appJwt);
+            req.Headers.UserAgent.ParseAdd("Demo-Factory/0.8");
+            req.Headers.Accept.ParseAdd("application/vnd.github+json");
+
+            using var resp = await http.SendAsync(req, ct);
+            if (!resp.IsSuccessStatusCode)
+            {
+                return new AppInstallationCheckResult(
+                    CheckedLive: false,
+                    InstalledOnOwner: false,
+                    InstallationId: null,
+                    InstallUrl: installUrl,
+                    Detail: $"GitHub App installations check returned HTTP {(int)resp.StatusCode}.");
+            }
+
+            using var doc = await JsonDocument.ParseAsync(await resp.Content.ReadAsStreamAsync(ct), cancellationToken: ct);
+            if (doc.RootElement.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var el in doc.RootElement.EnumerateArray())
+                {
+                    var acctLogin = el.TryGetProperty("account", out var acct) && acct.TryGetProperty("login", out var l)
+                        ? l.GetString()
+                        : null;
+                    if (string.Equals(acctLogin, owner, StringComparison.OrdinalIgnoreCase) && el.TryGetProperty("id", out var idProp))
+                    {
+                        var id = idProp.GetInt64();
+                        return new AppInstallationCheckResult(true, true, id, installUrl, $"Installed on @{owner} (installation #{id}).");
+                    }
+                }
+            }
+
+            return new AppInstallationCheckResult(
+                CheckedLive: true,
+                InstalledOnOwner: false,
+                InstallationId: null,
+                InstallUrl: installUrl,
+                Detail: $"GitHub App '{slug}' is registered, but not yet installed on @{owner}.");
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(ex, "Unable to query GitHub App installations for {Owner}", owner);
+            return new AppInstallationCheckResult(false, false, null, installUrl, $"Unable to verify installation: {ex.Message}");
+        }
+    }
+
     public async Task<string> CreateRepositoryFromTemplateAsync(
         string templateOwner,
         string templateRepo,
@@ -87,18 +182,59 @@ public sealed class GitHubGateway(
     {
         await PaceWriteAsync(ct);
 
-        if (!envOptions.Value.SandboxMode)
+        if (!IsSandbox)
         {
-            var octokit = await CreateDelegatedOctokitAsync(ct);
-            await octokit.Repository.Generate(templateOwner, templateRepo, new NewRepositoryFromTemplate(newRepo)
-            {
-                Owner = newOwner,
-                Private = !isPublic,
-                Description = "Autonomous demo repository managed by Demo-Factory"
-            });
+            using var http = await CreateDelegatedHttpAsync(ct);
+            var existingTarget = await TryGetJsonAsync(http, $"/repos/{newOwner}/{newRepo}", ct);
 
-            await UpsertRepoFileAsync(octokit, newOwner, newRepo, "docs/spec.md", specMarkdown, "docs: initialize living specification", ct);
-            await UpsertRepoFileAsync(octokit, newOwner, newRepo, "docs/adr/0001-architecture.md", adrMarkdown, "docs: record ADR-0001 architecture", ct);
+            if (existingTarget is null)
+            {
+                using var templateDoc = await TryGetJsonAsync(http, $"/repos/{templateOwner}/{templateRepo}", ct);
+                var isTemplate = templateDoc is not null
+                    && templateDoc.RootElement.TryGetProperty("is_template", out var it)
+                    && it.ValueKind == JsonValueKind.True;
+
+                if (isTemplate)
+                {
+                    await SendGitHubRestAsync(http, HttpMethod.Post, $"/repos/{templateOwner}/{templateRepo}/generate", new
+                    {
+                        owner = newOwner,
+                        name = newRepo,
+                        @private = !isPublic,
+                        description = "Autonomous demo repository managed by Demo-Factory"
+                    }, ct);
+                    await WaitForDefaultBranchReadyAsync(http, newOwner, newRepo, ct);
+                }
+                else
+                {
+                    using var meDoc = await TryGetJsonAsync(http, "/user", ct);
+                    var currentLogin = meDoc is not null && meDoc.RootElement.TryGetProperty("login", out var lp)
+                        ? lp.GetString()
+                        : envOptions.Value.OwnerLogin;
+
+                    var createPath = string.Equals(currentLogin, newOwner, StringComparison.OrdinalIgnoreCase)
+                        ? "/user/repos"
+                        : $"/orgs/{newOwner}/repos";
+
+                    await SendGitHubRestAsync(http, HttpMethod.Post, createPath, new
+                    {
+                        name = newRepo,
+                        @private = !isPublic,
+                        auto_init = true,
+                        description = "Autonomous demo repository managed by Demo-Factory"
+                    }, ct);
+
+                    await WaitForDefaultBranchReadyAsync(http, newOwner, newRepo, ct);
+                    await SeedGoldenPathTemplateFilesAsync(http, newOwner, newRepo, templateRepo, ct);
+                }
+            }
+            else
+            {
+                existingTarget.Dispose();
+            }
+
+            await UpsertRepoFileHttpAsync(http, newOwner, newRepo, "docs/spec.md", specMarkdown, "docs: initialize living specification", ct);
+            await UpsertRepoFileHttpAsync(http, newOwner, newRepo, "docs/adr/0001-architecture.md", adrMarkdown, "docs: record ADR-0001 architecture", ct);
         }
 
         await auditLogger.RecordAsync(
@@ -117,29 +253,29 @@ public sealed class GitHubGateway(
         await EnsureRepoAllowlistedAsync(owner, repo, ct);
         await PaceWriteAsync(ct);
 
-        if (!envOptions.Value.SandboxMode)
+        if (!IsSandbox)
         {
             using var http = await CreateDelegatedHttpAsync(ct);
 
-            // §5.3: Enable secret scanning + push protection + Dependabot security updates
-            await SendGitHubRestAsync(http, HttpMethod.Patch, $"/repos/{owner}/{repo}", new
+            if (isPublic)
             {
-                security_and_analysis = isPublic
-                    ? new
+                await TrySendGitHubRestAsync(http, HttpMethod.Patch, $"/repos/{owner}/{repo}", new
+                {
+                    security_and_analysis = new
                     {
                         secret_scanning = new { status = "enabled" },
                         secret_scanning_push_protection = new { status = "enabled" },
                         dependabot_security_updates = new { status = "enabled" }
                     }
-                    : null
-            }, ct);
+                }, ct);
+            }
 
-            await SendGitHubRestAsync(http, HttpMethod.Put, $"/repos/{owner}/{repo}/vulnerability-alerts", null, ct);
-            await SendGitHubRestAsync(http, HttpMethod.Put, $"/repos/{owner}/{repo}/private-vulnerability-reporting", null, ct);
+            await TrySendGitHubRestAsync(http, HttpMethod.Put, $"/repos/{owner}/{repo}/vulnerability-alerts", null, ct);
 
             if (isPublic)
             {
-                await SendGitHubRestAsync(http, HttpMethod.Patch, $"/repos/{owner}/{repo}/code-scanning/default-setup", new
+                await TrySendGitHubRestAsync(http, HttpMethod.Put, $"/repos/{owner}/{repo}/private-vulnerability-reporting", null, ct);
+                await TrySendGitHubRestAsync(http, HttpMethod.Patch, $"/repos/{owner}/{repo}/code-scanning/default-setup", new
                 {
                     state = "configured",
                     query_suite = "default"
@@ -165,11 +301,10 @@ public sealed class GitHubGateway(
         await EnsureRepoAllowlistedAsync(owner, repo, ct);
         await PaceWriteAsync(ct);
 
-        if (!envOptions.Value.SandboxMode)
+        if (!IsSandbox)
         {
             using var http = await CreateDelegatedHttpAsync(ct);
 
-            // §10.2 Repo merge settings
             await SendGitHubRestAsync(http, HttpMethod.Patch, $"/repos/{owner}/{repo}", new
             {
                 allow_auto_merge = true,
@@ -179,17 +314,15 @@ public sealed class GitHubGateway(
                 delete_branch_on_merge = true
             }, ct);
 
-            // §10.2 Default GITHUB_TOKEN read-only & Actions cannot approve PRs
-            await SendGitHubRestAsync(http, HttpMethod.Put, $"/repos/{owner}/{repo}/actions/permissions/workflow", new
+            await TrySendGitHubRestAsync(http, HttpMethod.Put, $"/repos/{owner}/{repo}/actions/permissions/workflow", new
             {
                 default_workflow_permissions = "read",
                 can_approve_pull_request_reviews = false
             }, ct);
 
-            // §5.1 Step 9b & §10.2 Environments preview and demo restricted to main
             foreach (var envName in new[] { "preview", "demo" })
             {
-                await SendGitHubRestAsync(http, HttpMethod.Put, $"/repos/{owner}/{repo}/environments/{envName}", new
+                var envCreated = await TrySendGitHubRestAsync(http, HttpMethod.Put, $"/repos/{owner}/{repo}/environments/{envName}", new
                 {
                     deployment_branch_policy = new
                     {
@@ -198,75 +331,121 @@ public sealed class GitHubGateway(
                     }
                 }, ct);
 
-                await SendGitHubRestAsync(http, HttpMethod.Post, $"/repos/{owner}/{repo}/environments/{envName}/deployment-branch-policies", new
+                if (envCreated)
                 {
-                    name = "main",
-                    type = "branch"
-                }, ct);
+                    await TrySendGitHubRestAsync(http, HttpMethod.Post, $"/repos/{owner}/{repo}/environments/{envName}/deployment-branch-policies", new
+                    {
+                        name = "main",
+                        type = "branch"
+                    }, ct);
+                }
             }
 
-            // §10.2 Default-branch ruleset with source-pinned required status checks & automatic Copilot code review
-            var checksList = requiredChecks
-                .Select(c => (object)new { context = c, integration_id = appOptions.Value.ActionsIntegrationId })
-                .Append(new { context = ReviewGateEvaluator.GateCheckName, integration_id = appOptions.Value.DemoFactoryIntegrationId })
-                .ToArray();
-
-            await SendGitHubRestAsync(http, HttpMethod.Post, $"/repos/{owner}/{repo}/rulesets", new
+            var rulesetsExist = await HasExistingRulesetAsync(http, owner, repo, "demo-factory-main-protection", ct);
+            if (!rulesetsExist)
             {
-                name = "demo-factory-main-protection",
-                target = "branch",
-                enforcement = "active",
-                conditions = new
+                var checksList = requiredChecks
+                    .Select(c => (object)new { context = c, integration_id = appOptions.Value.ActionsIntegrationId })
+                    .Append(new { context = ReviewGateEvaluator.GateCheckName, integration_id = appOptions.Value.DemoFactoryIntegrationId })
+                    .ToArray();
+
+                var fullRulesetApplied = await TrySendGitHubRestAsync(http, HttpMethod.Post, $"/repos/{owner}/{repo}/rulesets", new
                 {
-                    ref_name = new { include = new[] { "~DEFAULT_BRANCH" }, exclude = Array.Empty<string>() }
-                },
-                rules = new object[]
-                {
-                    new { type = "deletion" },
-                    new { type = "non_fast_forward" },
-                    new
+                    name = "demo-factory-main-protection",
+                    target = "branch",
+                    enforcement = "active",
+                    conditions = new
                     {
-                        type = "pull_request",
-                        parameters = new
-                        {
-                            required_approving_review_count = 0,
-                            dismiss_stale_reviews_on_push = false,
-                            require_code_owner_review = false,
-                            require_last_push_approval = false,
-                            required_review_thread_resolution = false
-                        }
+                        ref_name = new { include = new[] { "~DEFAULT_BRANCH" }, exclude = Array.Empty<string>() }
                     },
-                    new
+                    rules = new object[]
                     {
-                        type = "copilot_code_review",
-                        parameters = new
+                        new { type = "deletion" },
+                        new { type = "non_fast_forward" },
+                        new
                         {
-                            review_on_push = true,
-                            review_draft_pull_requests = false
-                        }
-                    },
-                    new
-                    {
-                        type = "required_status_checks",
-                        parameters = new
-                        {
-                            strict_required_status_checks_policy = true,
-                            required_status_checks = checksList
-                        }
-                    },
-                    new
-                    {
-                        type = "code_scanning",
-                        parameters = new
-                        {
-                            code_scanning_tools = new[]
+                            type = "pull_request",
+                            parameters = new
                             {
-                                new { tool = "CodeQL", security_alerts_threshold = "high_or_higher", alerts_threshold = "errors" }
+                                required_approving_review_count = 0,
+                                dismiss_stale_reviews_on_push = false,
+                                require_code_owner_review = false,
+                                require_last_push_approval = false,
+                                required_review_thread_resolution = false
+                            }
+                        },
+                        new
+                        {
+                            type = "copilot_code_review",
+                            parameters = new
+                            {
+                                review_on_push = true,
+                                review_draft_pull_requests = false
+                            }
+                        },
+                        new
+                        {
+                            type = "required_status_checks",
+                            parameters = new
+                            {
+                                strict_required_status_checks_policy = true,
+                                required_status_checks = checksList
+                            }
+                        },
+                        new
+                        {
+                            type = "code_scanning",
+                            parameters = new
+                            {
+                                code_scanning_tools = new[]
+                                {
+                                    new { tool = "CodeQL", security_alerts_threshold = "high_or_higher", alerts_threshold = "errors" }
+                                }
                             }
                         }
                     }
+                }, ct);
+
+                if (!fullRulesetApplied)
+                {
+                    await TrySendGitHubRestAsync(http, HttpMethod.Post, $"/repos/{owner}/{repo}/rulesets", new
+                    {
+                        name = "demo-factory-main-protection",
+                        target = "branch",
+                        enforcement = "active",
+                        conditions = new
+                        {
+                            ref_name = new { include = new[] { "~DEFAULT_BRANCH" }, exclude = Array.Empty<string>() }
+                        },
+                        rules = new object[]
+                        {
+                            new { type = "deletion" },
+                            new { type = "non_fast_forward" },
+                            new
+                            {
+                                type = "pull_request",
+                                parameters = new
+                                {
+                                    required_approving_review_count = 0,
+                                    dismiss_stale_reviews_on_push = false,
+                                    require_code_owner_review = false,
+                                    require_last_push_approval = false,
+                                    required_review_thread_resolution = false
+                                }
+                            },
+                            new
+                            {
+                                type = "required_status_checks",
+                                parameters = new
+                                {
+                                    strict_required_status_checks_policy = true,
+                                    required_status_checks = checksList
+                                }
+                            }
+                        }
+                    }, ct);
                 }
-            }, ct);
+            }
         }
 
         await auditLogger.RecordAsync(
@@ -287,23 +466,85 @@ public sealed class GitHubGateway(
         await EnsureRepoAllowlistedAsync(owner, repo, ct);
         await PaceWriteAsync(ct);
 
-        if (envOptions.Value.SandboxMode)
+        if (IsSandbox)
         {
             var num = Random.Shared.Next(10, 99);
             return ($"PVT_sandbox_{repo}_{num}", num);
         }
 
-        const string mutation = """
-            mutation CopyFactoryBoard($projectId: ID!, $ownerId: ID!, $title: String!) {
-              copyProjectV2(input: { projectId: $projectId, ownerId: $ownerId, title: $title, includeDraftIssues: false }) {
-                projectV2 { id number }
-              }
-            }
-            """;
+        try
+        {
+            const string repoNodeQuery = """
+                query ResolveRepoAndOwner($owner: String!, $repo: String!) {
+                  repository(owner: $owner, name: $repo) {
+                    id
+                    owner { id }
+                  }
+                }
+                """;
 
-        using var doc = await ExecuteGraphQlAsync(mutation, new { projectId = "PVT_template", ownerId = owner, title }, ct);
-        var p = doc.RootElement.GetProperty("data").GetProperty("copyProjectV2").GetProperty("projectV2");
-        return (p.GetProperty("id").GetString()!, p.GetProperty("number").GetInt32());
+            using var idsDoc = await ExecuteGraphQlAsync(repoNodeQuery, new { owner, repo }, ct);
+            var repoEl = idsDoc.RootElement.GetProperty("data").GetProperty("repository");
+            var repoNodeId = repoEl.GetProperty("id").GetString()!;
+            var ownerNodeId = repoEl.GetProperty("owner").GetProperty("id").GetString()!;
+
+            string projectId;
+            int projectNumber;
+
+            if (!string.IsNullOrWhiteSpace(appOptions.Value.TemplateProjectNodeId))
+            {
+                const string copyMutation = """
+                    mutation CopyFactoryBoard($projectId: ID!, $ownerId: ID!, $title: String!) {
+                      copyProjectV2(input: { projectId: $projectId, ownerId: $ownerId, title: $title, includeDraftIssues: false }) {
+                        projectV2 { id number }
+                      }
+                    }
+                    """;
+
+                using var copyDoc = await ExecuteGraphQlAsync(copyMutation, new { projectId = appOptions.Value.TemplateProjectNodeId, ownerId = ownerNodeId, title }, ct);
+                var p = copyDoc.RootElement.GetProperty("data").GetProperty("copyProjectV2").GetProperty("projectV2");
+                projectId = p.GetProperty("id").GetString()!;
+                projectNumber = p.GetProperty("number").GetInt32();
+            }
+            else
+            {
+                const string createMutation = """
+                    mutation CreateFactoryBoard($ownerId: ID!, $title: String!) {
+                      createProjectV2(input: { ownerId: $ownerId, title: $title }) {
+                        projectV2 { id number }
+                      }
+                    }
+                    """;
+
+                using var createDoc = await ExecuteGraphQlAsync(createMutation, new { ownerId = ownerNodeId, title }, ct);
+                var p = createDoc.RootElement.GetProperty("data").GetProperty("createProjectV2").GetProperty("projectV2");
+                projectId = p.GetProperty("id").GetString()!;
+                projectNumber = p.GetProperty("number").GetInt32();
+            }
+
+            const string linkMutation = """
+                mutation LinkBoardToRepo($projectId: ID!, $repositoryId: ID!) {
+                  linkProjectV2ToRepository(input: { projectId: $projectId, repositoryId: $repositoryId }) {
+                    repository { id }
+                  }
+                }
+                """;
+            try
+            {
+                using var _ = await ExecuteGraphQlAsync(linkMutation, new { projectId, repositoryId = repoNodeId }, ct);
+            }
+            catch (Exception linkEx)
+            {
+                logger.LogDebug(linkEx, "Optional linkProjectV2ToRepository skipped for {Owner}/{Repo}", owner, repo);
+            }
+
+            return (projectId, projectNumber);
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(ex, "Projects v2 creation unavailable for {Owner}/{Repo}; falling back to local SQL board mirror.", owner, repo);
+            return ($"PVT_unlinked_{repo}", 0);
+        }
     }
 
     public async Task<CreatedIssueRef> CreateIssueAsync(
@@ -317,7 +558,7 @@ public sealed class GitHubGateway(
         await EnsureRepoAllowlistedAsync(owner, repo, ct);
         await PaceWriteAsync(ct);
 
-        if (envOptions.Value.SandboxMode)
+        if (IsSandbox)
         {
             var num = Interlocked.Increment(ref _sandboxNextIssueNumber);
             var nodeId = $"I_sandbox_{repo}_{num}";
@@ -326,20 +567,39 @@ public sealed class GitHubGateway(
             return new CreatedIssueRef(num, nodeId, url);
         }
 
-        var octokit = await CreateDelegatedOctokitAsync(ct);
-        var newIssue = new NewIssue(title) { Body = body };
-        foreach (var l in labels)
-            newIssue.Labels.Add(l);
+        using var http = await CreateDelegatedHttpAsync(ct);
+        await EnsureLabelsExistHttpAsync(http, owner, repo, labels, ct);
 
-        var created = await octokit.Issue.Create(owner, repo, newIssue);
-        await LockConversationAsync(owner, repo, created.Number, ct);
-        return new CreatedIssueRef(created.Number, created.NodeId, created.HtmlUrl);
+        using var createdDoc = await SendGitHubRestForJsonAsync(http, HttpMethod.Post, $"/repos/{owner}/{repo}/issues", new
+        {
+            title,
+            body,
+            labels
+        }, ct);
+
+        var createdNumber = createdDoc.RootElement.GetProperty("number").GetInt32();
+        var createdNodeId = createdDoc.RootElement.GetProperty("node_id").GetString() ?? $"I_{repo}_{createdNumber}";
+        var createdUrl = createdDoc.RootElement.TryGetProperty("html_url", out var hu)
+            ? hu.GetString() ?? $"https://github.com/{owner}/{repo}/issues/{createdNumber}"
+            : $"https://github.com/{owner}/{repo}/issues/{createdNumber}";
+
+        try
+        {
+            await LockConversationAsync(owner, repo, createdNumber, ct);
+        }
+        catch (Exception ex)
+        {
+            logger.LogDebug(ex, "Issue lock skipped for {Owner}/{Repo}#{Number}", owner, repo, createdNumber);
+        }
+
+        await auditLogger.RecordAsync(envOptions.Value.OwnerLogin, "IssueCreated", "Issue", $"{owner}/{repo}#{createdNumber}", after: new { title, labels }, issueNumber: createdNumber, ct: ct);
+        return new CreatedIssueRef(createdNumber, createdNodeId, createdUrl);
     }
 
     public async Task AddBlockedByDependencyAsync(string dependentIssueNodeId, string blockerIssueNodeId, CancellationToken ct = default)
     {
         await PaceWriteAsync(ct);
-        if (envOptions.Value.SandboxMode)
+        if (IsSandbox)
             return;
 
         const string mutation = """
@@ -350,7 +610,14 @@ public sealed class GitHubGateway(
             }
             """;
 
-        using var _ = await ExecuteGraphQlAsync(mutation, new { issueId = dependentIssueNodeId, blockingIssueId = blockerIssueNodeId }, ct);
+        try
+        {
+            using var _ = await ExecuteGraphQlAsync(mutation, new { issueId = dependentIssueNodeId, blockingIssueId = blockerIssueNodeId }, ct);
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(ex, "addBlockedBy GraphQL call skipped between {Dependent} and {Blocker}", dependentIssueNodeId, blockerIssueNodeId);
+        }
     }
 
     public async Task<string> AddIssueToProjectBoardAsync(
@@ -365,8 +632,8 @@ public sealed class GitHubGateway(
         CancellationToken ct = default)
     {
         await PaceWriteAsync(ct);
-        if (envOptions.Value.SandboxMode)
-            return $"PVTI_sandbox_{issueNodeId}";
+        if (IsSandbox || string.IsNullOrWhiteSpace(projectId) || projectId.StartsWith("PVT_unlinked_", StringComparison.Ordinal))
+            return $"PVTI_local_{issueNodeId}";
 
         const string mutation = """
             mutation AddItem($projectId: ID!, $contentId: ID!) {
@@ -376,8 +643,16 @@ public sealed class GitHubGateway(
             }
             """;
 
-        using var doc = await ExecuteGraphQlAsync(mutation, new { projectId, contentId = issueNodeId }, ct);
-        return doc.RootElement.GetProperty("data").GetProperty("addProjectV2ItemById").GetProperty("item").GetProperty("id").GetString()!;
+        try
+        {
+            using var doc = await ExecuteGraphQlAsync(mutation, new { projectId, contentId = issueNodeId }, ct);
+            return doc.RootElement.GetProperty("data").GetProperty("addProjectV2ItemById").GetProperty("item").GetProperty("id").GetString()!;
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(ex, "Unable to add issue {IssueNodeId} to Project v2 {ProjectId}", issueNodeId, projectId);
+            return $"PVTI_local_{issueNodeId}";
+        }
     }
 
     public async Task UpdateProjectBoardItemAsync(
@@ -391,7 +666,7 @@ public sealed class GitHubGateway(
         CancellationToken ct = default)
     {
         await PaceWriteAsync(ct);
-        if (envOptions.Value.SandboxMode)
+        if (IsSandbox || string.IsNullOrWhiteSpace(projectId) || projectId.StartsWith("PVT_unlinked_", StringComparison.Ordinal))
             return;
 
         logger.LogInformation("Updated Project v2 {ProjectId} item {ItemId} -> Status={Status}, FactoryState={State}", projectId, itemId, status, factoryState);
@@ -399,7 +674,7 @@ public sealed class GitHubGateway(
 
     public async Task<IReadOnlyList<BoardCardItem>> PollProjectBoardAsync(string projectId, CancellationToken ct = default)
     {
-        if (envOptions.Value.SandboxMode)
+        if (IsSandbox || string.IsNullOrWhiteSpace(projectId) || projectId.StartsWith("PVT_unlinked_", StringComparison.Ordinal))
         {
             await using var db = await dbFactory.CreateDbContextAsync(ct);
             var repo = await db.Repositories.FirstOrDefaultAsync(r => r.GitHubProjectId == projectId, ct);
@@ -466,7 +741,7 @@ public sealed class GitHubGateway(
     public async Task LockConversationAsync(string owner, string repo, int issueOrPrNumber, CancellationToken ct = default)
     {
         await EnsureRepoAllowlistedAsync(owner, repo, ct);
-        if (envOptions.Value.SandboxMode)
+        if (IsSandbox)
             return;
 
         using var http = await CreateDelegatedHttpAsync(ct);
@@ -480,7 +755,7 @@ public sealed class GitHubGateway(
     {
         await EnsureRepoAllowlistedAsync(owner, repo, ct);
         await PaceWriteAsync(ct);
-        if (envOptions.Value.SandboxMode)
+        if (IsSandbox)
             return;
 
         var octokit = await CreateDelegatedOctokitAsync(ct);
@@ -496,7 +771,7 @@ public sealed class GitHubGateway(
     {
         await EnsureRepoAllowlistedAsync(owner, repo, ct);
         await PaceWriteAsync(ct);
-        if (envOptions.Value.SandboxMode)
+        if (IsSandbox)
             return;
 
         var octokit = await CreateDelegatedOctokitAsync(ct);
@@ -516,7 +791,7 @@ public sealed class GitHubGateway(
     {
         await EnsureRepoAllowlistedAsync(owner, repo, ct);
         await PaceWriteAsync(ct);
-        if (envOptions.Value.SandboxMode)
+        if (IsSandbox)
             return true;
 
         using var http = await CreateDelegatedHttpAsync(ct);
@@ -529,7 +804,7 @@ public sealed class GitHubGateway(
         await EnsureRepoAllowlistedAsync(owner, repo, ct);
         await PaceWriteAsync(ct);
 
-        if (envOptions.Value.SandboxMode)
+        if (IsSandbox)
         {
             var prNum = Interlocked.Increment(ref _sandboxNextPrNumber);
             await auditLogger.RecordAsync("factory-orchestrator", "RevertPrOpened", "PullRequest", $"{owner}/{repo}#{prNum}", after: new { revertedPr = mergedPrNumber, reason }, prNumber: prNum, ct: ct);
@@ -561,30 +836,42 @@ public sealed class GitHubGateway(
         await EnsureRepoAllowlistedAsync(owner, repo, ct);
         await PaceWriteAsync(ct);
 
-        if (envOptions.Value.SandboxMode)
+        if (IsSandbox)
         {
             var prNum = Interlocked.Increment(ref _sandboxNextPrNumber);
             await auditLogger.RecordAsync(envOptions.Value.OwnerLogin, "DocsPrOpened", "PullRequest", $"{owner}/{repo}#{prNum}", after: new { branchName, title, files = filesToCommit.Keys }, prNumber: prNum, ct: ct);
             return prNum;
         }
 
-        var octokit = await CreateDelegatedOctokitAsync(ct);
-        var repository = await octokit.Repository.Get(owner, repo);
-        var mainRef = await octokit.Git.Reference.Get(owner, repo, $"heads/{repository.DefaultBranch}");
-        await octokit.Git.Reference.Create(owner, repo, new NewReference($"refs/heads/{branchName}", mainRef.Object.Sha));
+        using var http = await CreateDelegatedHttpAsync(ct);
+        using var repoDoc = await SendGitHubRestForJsonAsync(http, HttpMethod.Get, $"/repos/{owner}/{repo}", null, ct);
+        var defaultBranch = repoDoc.RootElement.TryGetProperty("default_branch", out var dbp) ? dbp.GetString() ?? "main" : "main";
+
+        using var refDoc = await SendGitHubRestForJsonAsync(http, HttpMethod.Get, $"/repos/{owner}/{repo}/git/ref/heads/{defaultBranch}", null, ct);
+        var baseSha = refDoc.RootElement.GetProperty("object").GetProperty("sha").GetString()!;
+
+        await TrySendGitHubRestAsync(http, HttpMethod.Post, $"/repos/{owner}/{repo}/git/refs", new
+        {
+            @ref = $"refs/heads/{branchName}",
+            sha = baseSha
+        }, ct);
 
         foreach (var (path, content) in filesToCommit)
         {
-            await octokit.Repository.Content.CreateFile(owner, repo, path, new CreateFileRequest($"docs: {title}", content, branchName));
+            await UpsertRepoFileHttpAsync(http, owner, repo, path, content, $"docs: {title}", ct, branchName);
         }
 
-        var pr = await octokit.PullRequest.Create(owner, repo, new NewPullRequest(title, branchName, repository.DefaultBranch));
-        return pr.Number;
+        using var prDoc = await SendGitHubRestForJsonAsync(http, HttpMethod.Post, $"/repos/{owner}/{repo}/pulls", new
+        {
+            title,
+            head = branchName,
+            @base = defaultBranch,
+            body = $"Automated documentation/profile update opened by Demo-Factory: {title}"
+        }, ct);
+
+        return prDoc.RootElement.GetProperty("number").GetInt32();
     }
 
-    /// <summary>
-    /// Posts `demo-factory/review-gate` using the GitHub App Installation Token (§8.2, §8.3, §10.1).
-    /// </summary>
     public async Task PostReviewGateCheckRunAsync(
         long installationId,
         string owner,
@@ -604,9 +891,17 @@ public sealed class GitHubGateway(
             _ => "failure"
         };
 
-        if (!envOptions.Value.SandboxMode && installationId > 0)
+        var resolvedInstallationId = installationId;
+        if (!IsSandbox && (resolvedInstallationId <= 0 || resolvedInstallationId == 90421001))
         {
-            using var http = await CreateInstallationHttpAsync(installationId, ct);
+            var check = await CheckAppInstallationAsync(owner, repo, ct);
+            if (check.InstallationId.HasValue)
+                resolvedInstallationId = check.InstallationId.Value;
+        }
+
+        if (!IsSandbox && resolvedInstallationId > 0 && resolvedInstallationId != 90421001)
+        {
+            using var http = await CreateInstallationHttpAsync(resolvedInstallationId, ct);
             var summaryMd = string.Join("\n", result.Conditions
                 .Where(c => c.Applicable)
                 .Select(c => $"- {(c.Passed ? "PASS" : c.IsPending ? "WAIT" : "FAIL")} **C{c.Number} {c.Name}**: {c.Summary}"));
@@ -640,10 +935,13 @@ public sealed class GitHubGateway(
         await EnsureRepoAllowlistedAsync(owner, repo, ct);
         await PaceWriteAsync(ct);
 
-        if (!envOptions.Value.SandboxMode)
+        if (!IsSandbox)
         {
-            var octokit = await CreateDelegatedOctokitAsync(ct);
-            await octokit.Issue.Comment.Create(owner, repo, issueOrPrNumber, markdownBody);
+            using var http = await CreateDelegatedHttpAsync(ct);
+            await SendGitHubRestAsync(http, HttpMethod.Post, $"/repos/{owner}/{repo}/issues/{issueOrPrNumber}/comments", new
+            {
+                body = markdownBody
+            }, ct);
         }
 
         await auditLogger.RecordAsync(
@@ -661,10 +959,10 @@ public sealed class GitHubGateway(
         await EnsureRepoAllowlistedAsync(owner, repo, ct);
         await PaceWriteAsync(ct);
 
-        if (!envOptions.Value.SandboxMode)
+        if (!IsSandbox)
         {
             using var http = await CreateDelegatedHttpAsync(ct);
-            await SendGitHubRestAsync(http, HttpMethod.Post, $"/repos/{owner}/{repo}/pulls/{prNumber}/requested_reviewers", new
+            await TrySendGitHubRestAsync(http, HttpMethod.Post, $"/repos/{owner}/{repo}/pulls/{prNumber}/requested_reviewers", new
             {
                 reviewers = new[] { "copilot-pull-request-reviewer[bot]" }
             }, ct);
@@ -682,7 +980,7 @@ public sealed class GitHubGateway(
     public async Task RerunFailedWorkflowJobsAsync(string owner, string repo, long runId, CancellationToken ct = default)
     {
         await EnsureRepoAllowlistedAsync(owner, repo, ct);
-        if (!envOptions.Value.SandboxMode)
+        if (!IsSandbox)
         {
             using var http = await CreateDelegatedHttpAsync(ct);
             await SendGitHubRestAsync(http, HttpMethod.Post, $"/repos/{owner}/{repo}/actions/runs/{runId}/rerun-failed-jobs", null, ct);
@@ -691,6 +989,60 @@ public sealed class GitHubGateway(
 
     public async Task<IReadOnlyList<ReadinessCheckItem>> EvaluateRepositoryReadinessAsync(string owner, string repo, CancellationToken ct = default)
     {
+        if (!IsSandbox)
+        {
+            try
+            {
+                using var http = await CreateDelegatedHttpAsync(ct);
+                using var repoDoc = await TryGetJsonAsync(http, $"/repos/{owner}/{repo}", ct);
+                if (repoDoc is null)
+                {
+                    return
+                    [
+                        new("repo-exists", "Target repository accessible on GitHub", false, false, $"Repository '{owner}/{repo}' was not found or is not accessible to the signed-in user.")
+                    ];
+                }
+
+                var root = repoDoc.RootElement;
+                var autoMergeOk = root.TryGetProperty("allow_auto_merge", out var am) && am.ValueKind == JsonValueKind.True
+                    && root.TryGetProperty("allow_squash_merge", out var sq) && sq.ValueKind == JsonValueKind.True;
+
+                using var wfDoc = await TryGetJsonAsync(http, $"/repos/{owner}/{repo}/actions/permissions/workflow", ct);
+                var wfReadOnly = wfDoc is not null
+                    && wfDoc.RootElement.TryGetProperty("default_workflow_permissions", out var dwp)
+                    && string.Equals(dwp.GetString(), "read", StringComparison.OrdinalIgnoreCase);
+
+                using var previewEnv = await TryGetJsonAsync(http, $"/repos/{owner}/{repo}/environments/preview", ct);
+                using var demoEnv = await TryGetJsonAsync(http, $"/repos/{owner}/{repo}/environments/demo", ct);
+                var envsOk = previewEnv is not null && demoEnv is not null;
+
+                using var labelDoc = await TryGetJsonAsync(http, $"/repos/{owner}/{repo}/labels/factory", ct);
+                var hasWorkLabel = labelDoc is not null;
+
+                using var coderProfileDoc = await TryGetJsonAsync(http, $"/repos/{owner}/{repo}/contents/.github/agents/factory-coder.md", ct);
+                var hasCoderProfile = coderProfileDoc is not null;
+
+                var hasRuleset = await HasExistingRulesetAsync(http, owner, repo, "demo-factory-main-protection", ct);
+                var appCheck = await CheckAppInstallationAsync(owner, repo, ct);
+
+                return
+                [
+                    new("github-app-installed", "GitHub App installed on repository", appCheck.InstalledOnOwner, false, appCheck.Detail),
+                    new("copilot-review-ruleset", "Default-branch protection & Copilot review ruleset", hasRuleset, true, hasRuleset ? "Ruleset 'demo-factory-main-protection' active." : "Ruleset 'demo-factory-main-protection' not configured yet."),
+                    new("pinned-required-checks", "Required checks pinned to GitHub Actions & Demo-Factory App", hasRuleset, true, hasRuleset ? "Required status checks active on default branch." : "Will be configured when rulesets are applied."),
+                    new("workflow-permissions", "Read-only default GITHUB_TOKEN & PR approval disabled", wfReadOnly, true, wfReadOnly ? "Default workflow token is read-only." : "Default workflow token is not restricted to read-only."),
+                    new("environments-main-only", "preview and demo environments configured", envsOk, true, envsOk ? "Both 'preview' and 'demo' environments exist." : "Missing 'preview' or 'demo' deployment environment."),
+                    new("work-label-and-forms", "Work label 'factory' present", hasWorkLabel, true, hasWorkLabel ? "Label 'factory' found." : "Label 'factory' missing; will be created automatically."),
+                    new("auto-merge-squash", "Auto-merge & squash-only enabled", autoMergeOk, true, autoMergeOk ? "Auto-merge and squash merge enabled." : "Auto-merge or squash merge disabled."),
+                    new("factory-coder-profile", ".github/agents/factory-coder.md present", hasCoderProfile, true, hasCoderProfile ? "Custom agent profile detected." : "Missing .github/agents/factory-coder.md; can open onboarding PR.")
+                ];
+            }
+            catch (Exception ex)
+            {
+                logger.LogWarning(ex, "Live readiness evaluation failed for {Owner}/{Repo}", owner, repo);
+            }
+        }
+
         await using var db = await dbFactory.CreateDbContextAsync(ct);
         var existing = await db.Repositories.FirstOrDefaultAsync(r => r.Owner == owner && r.Name == repo, ct);
         if (existing is not null && !string.IsNullOrWhiteSpace(existing.ReadinessReportJson))
@@ -736,7 +1088,7 @@ public sealed class GitHubGateway(
 
     private async Task PaceWriteAsync(CancellationToken ct)
     {
-        if (envOptions.Value.SandboxMode)
+        if (IsSandbox)
             return;
 
         await _writePacer.WaitAsync(ct);
@@ -771,11 +1123,13 @@ public sealed class GitHubGateway(
         client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", token);
         client.DefaultRequestHeaders.UserAgent.ParseAdd("Demo-Factory/0.8");
         client.DefaultRequestHeaders.Accept.ParseAdd("application/vnd.github+json");
+        client.DefaultRequestHeaders.TryAddWithoutValidation("X-GitHub-Api-Version", "2022-11-28");
         return client;
     }
 
     private async Task<HttpClient> CreateInstallationHttpAsync(long installationId, CancellationToken ct)
     {
+        tokenBroker.EnsureConfigurationLoaded();
         var appJwt = await jwtSigner.CreateAppJwtAsync(ct);
         using var bootstrap = httpClientFactory.CreateClient("GitHubApi");
         using var req = new HttpRequestMessage(HttpMethod.Post, $"https://api.github.com/app/installations/{installationId}/access_tokens");
@@ -805,7 +1159,17 @@ public sealed class GitHubGateway(
             await Task.Delay(retryDelta, ct);
         }
         resp.EnsureSuccessStatusCode();
-        return await JsonDocument.ParseAsync(await resp.Content.ReadAsStreamAsync(ct), cancellationToken: ct);
+        var doc = await JsonDocument.ParseAsync(await resp.Content.ReadAsStreamAsync(ct), cancellationToken: ct);
+        if (doc.RootElement.TryGetProperty("errors", out var errors) && errors.ValueKind == JsonValueKind.Array && errors.GetArrayLength() > 0)
+        {
+            var messages = errors.EnumerateArray()
+                .Select(e => e.TryGetProperty("message", out var m) ? m.GetString() : e.GetRawText())
+                .Where(s => !string.IsNullOrWhiteSpace(s));
+            var errMsg = string.Join("; ", messages);
+            doc.Dispose();
+            throw new InvalidOperationException($"GitHub GraphQL error: {errMsg}");
+        }
+        return doc;
     }
 
     private static async Task SendGitHubRestAsync(HttpClient http, HttpMethod method, string path, object? body, CancellationToken ct)
@@ -819,25 +1183,164 @@ public sealed class GitHubGateway(
         {
             await Task.Delay(retryDelta, ct);
         }
-        resp.EnsureSuccessStatusCode();
+        if (!resp.IsSuccessStatusCode)
+        {
+            var detail = await resp.Content.ReadAsStringAsync(ct);
+            throw new HttpRequestException($"GitHub REST {method} {path} failed with HTTP {(int)resp.StatusCode}: {detail}", null, resp.StatusCode);
+        }
     }
 
-    private static async Task UpsertRepoFileAsync(GitHubClient octokit, string owner, string repo, string path, string content, string message, CancellationToken ct)
+    private async Task<bool> TrySendGitHubRestAsync(HttpClient http, HttpMethod method, string path, object? body, CancellationToken ct)
     {
         try
         {
-            var existing = await octokit.Repository.Content.GetAllContents(owner, repo, path);
-            if (existing.Count > 0)
+            using var req = new HttpRequestMessage(method, $"https://api.github.com{path}")
             {
-                await octokit.Repository.Content.UpdateFile(owner, repo, path, new UpdateFileRequest(message, content, existing[0].Sha));
-                return;
+                Content = body is null ? null : JsonContent.Create(body)
+            };
+            using var resp = await http.SendAsync(req, ct);
+            if (resp.Headers.RetryAfter?.Delta is { } retryDelta)
+            {
+                await Task.Delay(retryDelta, ct);
             }
+            if (!resp.IsSuccessStatusCode)
+            {
+                var detail = await resp.Content.ReadAsStringAsync(ct);
+                logger.LogWarning("Optional GitHub REST {Method} {Path} returned HTTP {Status}: {Detail}", method, path, (int)resp.StatusCode, detail);
+                return false;
+            }
+            return true;
         }
-        catch (NotFoundException)
+        catch (Exception ex)
         {
+            logger.LogWarning(ex, "Optional GitHub REST {Method} {Path} threw exception", method, path);
+            return false;
+        }
+    }
+
+    private static async Task<JsonDocument> SendGitHubRestForJsonAsync(HttpClient http, HttpMethod method, string path, object? body, CancellationToken ct)
+    {
+        using var req = new HttpRequestMessage(method, $"https://api.github.com{path}")
+        {
+            Content = body is null ? null : JsonContent.Create(body)
+        };
+        using var resp = await http.SendAsync(req, ct);
+        if (resp.Headers.RetryAfter?.Delta is { } retryDelta)
+        {
+            await Task.Delay(retryDelta, ct);
+        }
+        if (!resp.IsSuccessStatusCode)
+        {
+            var detail = await resp.Content.ReadAsStringAsync(ct);
+            throw new HttpRequestException($"GitHub REST {method} {path} failed with HTTP {(int)resp.StatusCode}: {detail}", null, resp.StatusCode);
+        }
+        return await JsonDocument.ParseAsync(await resp.Content.ReadAsStreamAsync(ct), cancellationToken: ct);
+    }
+
+    private static async Task<JsonDocument?> TryGetJsonAsync(HttpClient http, string path, CancellationToken ct)
+    {
+        using var resp = await http.GetAsync($"https://api.github.com{path}", ct);
+        if (!resp.IsSuccessStatusCode)
+            return null;
+        return await JsonDocument.ParseAsync(await resp.Content.ReadAsStreamAsync(ct), cancellationToken: ct);
+    }
+
+    private static async Task<bool> HasExistingRulesetAsync(HttpClient http, string owner, string repo, string rulesetName, CancellationToken ct)
+    {
+        using var doc = await TryGetJsonAsync(http, $"/repos/{owner}/{repo}/rulesets", ct);
+        if (doc is null || doc.RootElement.ValueKind != JsonValueKind.Array)
+            return false;
+
+        foreach (var item in doc.RootElement.EnumerateArray())
+        {
+            if (item.TryGetProperty("name", out var n) && string.Equals(n.GetString(), rulesetName, StringComparison.OrdinalIgnoreCase))
+                return true;
+        }
+        return false;
+    }
+
+    private static async Task WaitForDefaultBranchReadyAsync(HttpClient http, string owner, string repo, CancellationToken ct)
+    {
+        for (var attempt = 0; attempt < 6; attempt++)
+        {
+            using var repoDoc = await TryGetJsonAsync(http, $"/repos/{owner}/{repo}", ct);
+            if (repoDoc is not null)
+            {
+                var branch = repoDoc.RootElement.TryGetProperty("default_branch", out var dbp) ? dbp.GetString() ?? "main" : "main";
+                using var refDoc = await TryGetJsonAsync(http, $"/repos/{owner}/{repo}/git/ref/heads/{branch}", ct);
+                if (refDoc is not null)
+                    return;
+            }
+            await Task.Delay(400, ct);
+        }
+    }
+
+    private async Task SeedGoldenPathTemplateFilesAsync(HttpClient http, string owner, string repo, string templateRepo, CancellationToken ct)
+    {
+        var templateKey = templateRepo.Contains("python", StringComparison.OrdinalIgnoreCase) ? "python-fastapi" : "dotnet-react";
+        var baseDir = envOptions.Value.TemplatesDirectory;
+        if (!Path.IsPathRooted(baseDir))
+        {
+            var fromCwd = Path.Combine(Directory.GetCurrentDirectory(), baseDir);
+            var fromRoot = Path.GetFullPath(Path.Combine(Directory.GetCurrentDirectory(), "..", "..", baseDir));
+            baseDir = Directory.Exists(fromCwd) ? fromCwd : Directory.Exists(fromRoot) ? fromRoot : fromCwd;
         }
 
-        await octokit.Repository.Content.CreateFile(owner, repo, path, new CreateFileRequest(message, content));
+        var templateDir = Path.Combine(baseDir, templateKey);
+        if (!Directory.Exists(templateDir))
+            return;
+
+        foreach (var filePath in Directory.EnumerateFiles(templateDir, "*", SearchOption.AllDirectories))
+        {
+            var relPath = Path.GetRelativePath(templateDir, filePath).Replace('\\', '/');
+            var content = await File.ReadAllTextAsync(filePath, ct);
+            await UpsertRepoFileHttpAsync(http, owner, repo, relPath, content, $"chore: scaffold golden-path {relPath}", ct);
+        }
+    }
+
+    private static async Task EnsureLabelsExistHttpAsync(HttpClient http, string owner, string repo, IReadOnlyList<string> labels, CancellationToken ct)
+    {
+        foreach (var label in labels.Distinct(StringComparer.OrdinalIgnoreCase))
+        {
+            using var existing = await TryGetJsonAsync(http, $"/repos/{owner}/{repo}/labels/{Uri.EscapeDataString(label)}", ct);
+            if (existing is not null)
+                continue;
+
+            var color = label.ToLowerInvariant() switch
+            {
+                "factory" => "0E8A16",
+                "acceptance-test" => "1D76DB",
+                _ => "5319E7"
+            };
+
+            using var createResp = await http.PostAsJsonAsync($"https://api.github.com/repos/{owner}/{repo}/labels", new
+            {
+                name = label,
+                color
+            }, ct);
+        }
+    }
+
+    private static async Task UpsertRepoFileHttpAsync(HttpClient http, string owner, string repo, string path, string content, string message, CancellationToken ct, string? branch = null)
+    {
+        var query = string.IsNullOrWhiteSpace(branch) ? string.Empty : $"?ref={Uri.EscapeDataString(branch)}";
+        using var existing = await TryGetJsonAsync(http, $"/repos/{owner}/{repo}/contents/{path}{query}", ct);
+        string? existingSha = null;
+        if (existing is not null && existing.RootElement.ValueKind == JsonValueKind.Object && existing.RootElement.TryGetProperty("sha", out var sp))
+        {
+            existingSha = sp.GetString();
+        }
+
+        var encoded = System.Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(content));
+        object payload = existingSha is not null
+            ? branch is not null
+                ? new { message, content = encoded, sha = existingSha, branch }
+                : new { message, content = encoded, sha = existingSha }
+            : branch is not null
+                ? new { message, content = encoded, branch }
+                : new { message, content = encoded };
+
+        await SendGitHubRestAsync(http, HttpMethod.Put, $"/repos/{owner}/{repo}/contents/{path}", payload, ct);
     }
 }
 

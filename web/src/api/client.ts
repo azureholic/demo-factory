@@ -35,8 +35,37 @@ export interface FactoryStatusDto {
   globalPaused: boolean;
   anyLineStopped: boolean;
   reconnectRequired: boolean;
+  sandboxMode?: boolean;
   profile: string;
   ownerLogin: string;
+}
+
+export interface SystemReadinessDto {
+  sandboxMode: boolean;
+  ownerLogin: string;
+  gitHub: {
+    oauthConfigured: boolean;
+    privateKeyConfigured: boolean;
+    appId: string;
+    appSlug: string;
+    clientId: string;
+    delegatedTokenConnected: boolean;
+    tokenKind: string;
+    reconnectRequired: boolean;
+    appInstallation: {
+      checkedLive: boolean;
+      installedOnOwner: boolean;
+      installationId?: number | null;
+      installUrl: string;
+      detail: string;
+    };
+  };
+  foundry: {
+    configured: boolean;
+    projectEndpoint: string;
+    deployment: string;
+    region: string;
+  };
 }
 
 export interface ProjectSummary {
@@ -177,6 +206,12 @@ export const api = {
     request('/auth/preferences', { method: 'PUT', body: JSON.stringify(prefs) }),
   revokeGitHub: () => request('/auth/revoke', { method: 'POST' }),
   getFactoryStatus: () => request<FactoryStatusDto>('/api/factory/status'),
+  getSystemReadiness: () => request<SystemReadinessDto>('/api/system/readiness'),
+  setExecutionMode: (sandboxMode: boolean, force = false) =>
+    request<{ sandboxMode: boolean }>('/api/system/mode', {
+      method: 'POST',
+      body: JSON.stringify({ sandboxMode, force })
+    }),
   pauseFactory: (repoId?: string) =>
     request(`/api/factory:pause${repoId ? `?repo=${repoId}` : ''}`, { method: 'POST' }),
   resumeFactory: (repoId?: string) =>

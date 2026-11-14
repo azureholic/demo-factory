@@ -74,12 +74,14 @@ public static class AuthEndpoints
             IOptions<FactoryEnvironmentOptions> envOptions) =>
         {
             var baseUrl = ResolvePublicBaseUrl(http);
+            var isSandbox = envOptions.Value.GetEffectiveSandboxMode();
             return Results.Ok(new
             {
                 gitHubConfigured = tokenBroker.IsGitHubOAuthConfigured,
                 clientId = tokenBroker.IsGitHubOAuthConfigured ? tokenBroker.ActiveClientId : string.Empty,
                 appSlug = tokenBroker.ActiveAppSlug,
-                sandboxAvailable = envOptions.Value.SandboxMode || hostEnv.IsDevelopment(),
+                sandboxMode = isSandbox,
+                sandboxAvailable = isSandbox || hostEnv.IsDevelopment(),
                 defaultOwnerLogin = envOptions.Value.OwnerLogin,
                 callbackUrl = $"{baseUrl}/auth/github/callback"
             });
@@ -196,7 +198,7 @@ public static class AuthEndpoints
             IOptions<FactoryEnvironmentOptions> envOptions,
             IAuditLogger auditLogger) =>
         {
-            if (!envOptions.Value.SandboxMode && !hostEnv.IsDevelopment())
+            if (!envOptions.Value.GetEffectiveSandboxMode() && !hostEnv.IsDevelopment())
                 return Results.Forbid();
 
             var requestedLogin = string.IsNullOrWhiteSpace(req?.Login) ? envOptions.Value.OwnerLogin : req.Login.Trim();
@@ -238,7 +240,7 @@ public static class AuthEndpoints
 
             if (!tokenBroker.IsGitHubOAuthConfigured)
             {
-                if (envOptions.Value.SandboxMode)
+                if (envOptions.Value.GetEffectiveSandboxMode())
                 {
                     var sandboxSession = await tokenBroker.CompleteSandboxSignInAsync(envOptions.Value.OwnerLogin, http.RequestAborted);
                     await SignInAllowlistedCookieAsync(http, dbFactory, sandboxSession.Login, sandboxSession.AvatarUrl, sandboxSession.AuthMode, autoEnrollInDev: true);

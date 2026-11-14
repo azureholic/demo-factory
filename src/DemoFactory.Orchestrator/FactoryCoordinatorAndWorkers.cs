@@ -695,12 +695,19 @@ public sealed class FactoryOrchestrationCoordinator(
         var repo = await db.Repositories.FirstOrDefaultAsync(r => r.ProjectId == project.Id, ct);
         if (repo is null)
         {
+            var resolvedInstId = 90421001L;
+            if (!envOptions.Value.GetEffectiveSandboxMode())
+            {
+                var instCheck = await gitHub.CheckAppInstallationAsync(owner, repoName, ct);
+                resolvedInstId = instCheck.InstallationId ?? 0L;
+            }
+
             repo = new RepositoryEntity
             {
                 ProjectId = project.Id,
                 Owner = owner,
                 Name = repoName,
-                InstallationId = 90421001,
+                InstallationId = resolvedInstId,
                 PolicyReference = $"policies/repos/{owner}__{repoName}.yml",
                 ReadinessPassed = true
             };

@@ -69,20 +69,21 @@ public sealed class CopilotAgentClient(
     IOptions<FactoryEnvironmentOptions> envOptions,
     ILogger<CopilotAgentClient> logger) : ICopilotAgentClient
 {
+    private bool IsSandbox => envOptions.Value.GetEffectiveSandboxMode();
+
     public async Task<CopilotAssignmentResult> AssignIssueAsync(CopilotAssignmentRequest request, CancellationToken ct = default)
     {
         await EnsureNoActiveSessionAsync(request.WorkItemId, ct);
         await EnsureBudgetAvailableAsync(request.RepoId, request.WorkItemId, ct);
 
         var taskId = $"task_cp_{Guid.NewGuid():N}"[..16];
-        var sessionUrl = $"https://github.com/{request.Owner}/{request.Repo}/issues/{request.IssueNumber}#agent-{taskId}";
+        var sessionUrl = $"https://github.com/{request.Owner}/{request.Repo}/issues/{request.IssueNumber}";
 
-        if (!envOptions.Value.SandboxMode)
+        if (!IsSandbox)
         {
             var token = await tokenBroker.GetDelegatedAccessTokenAsync(envOptions.Value.OwnerLogin, ct);
             using var http = CreateGitHubHttp(token);
 
-            // §8.2 Step 3 & §9.2: Assign issue to copilot-swe-agent[bot] with agent_assignment
             using var resp = await http.PostAsJsonAsync(
                 $"https://api.github.com/repos/{request.Owner}/{request.Repo}/issues/{request.IssueNumber}/assignees",
                 new
@@ -98,7 +99,12 @@ public sealed class CopilotAgentClient(
                     }
                 },
                 ct);
-            resp.EnsureSuccessStatusCode();
+
+            if (!resp.IsSuccessStatusCode)
+            {
+                var detail = await resp.Content.ReadAsStringAsync(ct);
+                throw new InvalidOperationException($"GitHub Copilot cloud agent assignment failed with HTTP {(int)resp.StatusCode} on {request.Owner}/{request.Repo}#{request.IssueNumber}: {detail}");
+            }
         }
 
         var session = new AgentSessionEntity
@@ -141,7 +147,7 @@ public sealed class CopilotAgentClient(
         var body = FormatBatchedCopilotPrompt(request);
         long? commentId = null;
 
-        if (!envOptions.Value.SandboxMode)
+        if (!IsSandbox)
         {
             var token = await tokenBroker.GetDelegatedAccessTokenAsync(envOptions.Value.OwnerLogin, ct);
             using var http = CreateGitHubHttp(token);
@@ -206,7 +212,7 @@ public sealed class CopilotAgentClient(
         const string body = "@copilot merge main into this branch and resolve conflicts without modifying any protected paths.";
         long commentId = Random.Shared.NextInt64(900000, 999999);
 
-        if (!envOptions.Value.SandboxMode)
+        if (!IsSandbox)
         {
             var token = await tokenBroker.GetDelegatedAccessTokenAsync(envOptions.Value.OwnerLogin, ct);
             using var http = CreateGitHubHttp(token);
@@ -245,7 +251,7 @@ public sealed class CopilotAgentClient(
         await using var db = await dbFactory.CreateDbContextAsync(ct);
         var existing = await db.AgentSessions.FirstOrDefaultAsync(s => s.CopilotTaskId == copilotTaskId, ct);
 
-        if (envOptions.Value.SandboxMode)
+        if (IsSandbox)
         {
             return new AgentTaskSnapshot(
                 copilotTaskId,
