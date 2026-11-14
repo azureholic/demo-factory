@@ -40,6 +40,7 @@ public sealed class FactoryEndToEndTests : IAsyncLifetime
                     ["Factory:OwnerLogin"] = "azureholic",
                     ["Factory:PoliciesDirectory"] = _policiesDir,
                     ["Factory:LocalDataDirectory"] = _policiesDir,
+                    ["Foundry:ProjectEndpoint"] = "",
                     ["GitHub:WebhookSecret"] = WebhookSecret
                 });
             });
@@ -308,7 +309,8 @@ public sealed class FactoryEndToEndTests : IAsyncLifetime
                         ["Factory:SandboxMode"] = "true",
                         ["Factory:AllowTestHeaderAuth"] = "false",
                         ["Factory:LocalDataDirectory"] = isolatedDir,
-                        ["Factory:PoliciesDirectory"] = isolatedDir
+                        ["Factory:PoliciesDirectory"] = isolatedDir,
+                        ["Foundry:ProjectEndpoint"] = ""
                     });
                 });
             });
@@ -390,6 +392,7 @@ public sealed class FactoryEndToEndTests : IAsyncLifetime
                         ["Factory:AllowTestHeaderAuth"] = "true",
                         ["Factory:LocalDataDirectory"] = isolatedDir,
                         ["Factory:PoliciesDirectory"] = isolatedDir,
+                        ["Foundry:ProjectEndpoint"] = "",
                         ["GitHub:AppId"] = "5758548",
                         ["GitHub:AppSlug"] = "azureholic-demo-factory",
                         ["GitHub:ClientId"] = "Iv23liUfMKApH3rhp0J4",

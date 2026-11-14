@@ -9,12 +9,13 @@ infra:
 
 services:
   factory-api:
-    project: .
+    project: ./src/DemoFactory.Api
     language: dotnet
     host: containerapp
     docker:
-      path: ./Dockerfile
-      context: .
+      path: ../../Dockerfile
+      context: ../..
+      remoteBuild: true
 
 hooks:
   postprovision:

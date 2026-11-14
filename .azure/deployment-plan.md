@@ -1,9 +1,9 @@
 # Azure Deployment Plan
 
-> **Status:** Ready for Validation
+> **Status:** Deployed
 
 Generated: 2026-11-14T10:38:00+01:00
-Updated: 2026-11-14T11:40:00+01:00
+Updated: 2026-11-14T15:25:00+01:00
 
 ---
 
@@ -22,8 +22,10 @@ Updated: 2026-11-14T11:40:00+01:00
 | Classification | Development / Reference Implementation |
 | Scale | Small (Lean profile default: single Container App) to Medium (Reference profile: 3 Container Apps) |
 | Budget | Cost-Optimized (Lean profile default, serverless SQL, Consumption Durable Task Scheduler) |
-| **Subscription** | Pending user confirmation (local implementation vs. live Azure subscription) |
-| **Location** | `swedencentral` (EU region for Foundry data residency; pending user confirmation) |
+| **Tenant** | `Zava` (`6e689817-26c3-498a-a758-a45e53e81733`, `diax84977607.onmicrosoft.com`) |
+| **Subscription** | `zava-workload-2` (`05ad4d79-8611-4df8-9193-f96001436be9`) |
+| **Principal** | `admin@diax84977607.onmicrosoft.com` (`4a602d8d-68c1-45ba-b08a-4224e267f609`, Owner) |
+| **Location** | `swedencentral` (confirmed EU region for Microsoft Foundry `DataZoneStandard` `gpt-4.1-eu` & hosting) |
 
 ---
 
@@ -88,13 +90,71 @@ Updated: 2026-11-14T11:40:00+01:00
 - [x] Implement unit/property tests (`DemoFactory.Domain.Tests`), orchestration replay tests (`DemoFactory.Orchestrator.Tests`), and E2E/API integration tests (`DemoFactory.E2E`)
 - [x] Verify `dotnet build`, `dotnet test` (18/18 passed), `npm run build`, `npm test`, `az bicep build` (0 warnings/errors), and live integrated browser verification
 
+### Phase 3: Pre-Deployment Validation
+- [x] All validation checks pass
+  - [x] 1. AZD Installation (`azd version 1.37.3`)
+  - [x] 2. Schema Validation (`validate_azure_yaml` passed)
+  - [x] 3. Environment Setup (`demofactory-swe1` / `rg-demofactory-swe1`)
+  - [x] 4. Authentication Check (`azd` aligned to `az` CLI context `admin@diax84977607.onmicrosoft.com`)
+  - [x] 5. Subscription/Location Check (`zava-workload-2` / `05ad4d79-8611-4df8-9193-f96001436be9` in `swedencentral`)
+  - [x] 6. Aspire Pre-Provisioning Checks (verified; no Functions projects)
+  - [x] 7. Provision Preview (`azd provision --preview --no-prompt` succeeded across all 11 resources including Foundry project & `gpt-4.1-eu`)
+  - [x] 8. Build Verification (`dotnet test DemoFactory.slnx -c Release` 20/20 passed; `npm run build && npm test` passed; Node.js `node:22-alpine` GA LTS verified)
+  - [x] 9. Docker Build Context Validation (`.dockerignore` + `Dockerfile` + ACR `remoteBuild: true` verified)
+  - [x] 10. Package Validation (ACR remote build configured in `azure.yaml`)
+  - [x] 11. Azure Policy Validation (`az policy assignment list` verified — no blocking SKU/location/type policies)
+  - [x] 12. Aspire Post-Provisioning Checks (`AZURE_CONTAINER_REGISTRY_ENDPOINT` and `MANAGED_IDENTITY_NAME` emitted by `main.bicep`)
+
+---
+
+## Role Assignment Verification
+- Status: Verified
+- Identities checked: `factoryIdentity` (`${prefix}-uami` User-Assigned Managed Identity), deploying developer principal (`4a602d8d-68c1-45ba-b08a-4224e267f609`)
+- Roles confirmed:
+  - `AcrPull` on `acr` -> `factoryIdentity`
+  - `Key Vault Crypto User` on `keyVault` -> `factoryIdentity`; `Key Vault Crypto Officer` -> developer principal
+  - `Storage Blob Data Contributor` on `evidenceStorage` -> `factoryIdentity`
+  - `Durable Task Data Contributor` on `scheduler` -> `factoryIdentity` + developer principal
+  - `Cognitive Services User`, `Azure AI User`, `Cognitive Services OpenAI User` on `foundryAccount` -> `factoryIdentity` + developer principal
+  - `Azure Service Bus Data Owner` on `serviceBus` (Reference profile) -> `factoryIdentity`
+  - Azure SQL Entra data-plane roles (`db_datareader`, `db_datawriter`, `db_ddladmin`) -> `factoryIdentity` via `scripts/grant-sql-access.ps1`
+- Issues: Added `Azure AI User`, `Cognitive Services OpenAI User`, `Key Vault Crypto Officer` (developer), and `Azure Service Bus Data Owner` (Reference profile); fixed `grant-sql-access` to target `MANAGED_IDENTITY_NAME`.
+
 ---
 
 ## 7. Validation Proof (Local Build, Test & IaC)
 
 | Check | Command Run | Result |
 |-------|-------------|--------|
-| .NET 11 Solution Build & Tests | `dotnet test DemoFactory.slnx` | ✅ Pass (18/18 tests: 10 Domain + FsCheck property, 4 Orchestrator Replay & MAF, 4 E2E) |
-| Web Frontend TypeScript & Vite Bundle | `npm run build && npm test` | ✅ Pass (0 TS errors, Vitest passed) |
-| Azure Bicep Infrastructure Lint & Compile | `az bicep build --file infra/main.bicep` | ✅ Pass (0 errors, 0 BCP warnings, Entra-only SQL & Storage) |
-| Live UI & SignalR Verification | `DemoFactory.Api` + Integrated Browser | ✅ Pass (Overview, Board, Work Item 15-condition Gate, Issue Inbox, Theme toggle) |
+| .NET 11 Solution Build & Tests | `dotnet test DemoFactory.slnx -c Release` | ✅ Pass (20/20 tests: 10 Domain + FsCheck property, 4 Orchestrator Replay & MAF, 6 E2E) |
+| Web Frontend TypeScript & Vite Bundle | `npm run build && npm test` | ✅ Pass (0 TS errors, Vitest passed; `Dockerfile` uses `node:22-alpine` GA LTS) |
+| `azure.yaml` Schema Validation | `Azure-MCP-azd validate_azure_yaml` | ✅ Pass (`azure.yaml is valid against the stable schema`) |
+| Azure Bicep Infrastructure Lint & Compile | `Bicep-build_bicep infra/main.bicep` | ✅ Pass (0 errors, 0 warnings, Entra-only SQL & Storage) |
+| Azure Quota & Provider Registration | `az provider show` + `az cognitiveservices usage list -l swedencentral` | ✅ Pass (All 10 providers Registered; `OpenAI.DataZoneStandard.gpt4.1` 1,000K TPM available) |
+| Azure Policy Compliance | `az policy assignment list --subscription 05ad4d79-8611-4df8-9193-f96001436be9` | ✅ Pass (Default ASC audit policies only; 0 deny policies) |
+| Provisioning Preview (`what-if`) | `azd provision --preview --no-prompt` | ✅ Pass (VNet `10.200.0.0/16` + SQL/KV/Blob PEPs + Foundry + Container Apps in `rg-demofactory-swe1` / `Sweden Central`) |
+
+---
+
+## 8. Deployment & Live Verification (`demofactory-swe1` / `swedencentral`)
+
+| Resource | Deployed Value |
+|----------|----------------|
+| Public UI & API Endpoint | `https://df-demofact-xfv37byc-vnet-api.calmmushroom-a064ad20.swedencentral.azurecontainerapps.io` |
+| Virtual Network (`10.200.0.0/16`) | `df-demofact-xfv37byc-vnet` (`snet-cae` `10.200.0.0/23`, `snet-pep` `10.200.2.0/24`) |
+| Private Endpoints | `df-demofact-xfv37byc-sql-pep` (`sqlServer`), `df-demofact-xfv37byc-kv-pep` (`vault`), `df-demofact-xfv37byc-blob-pep` (`blob`) |
+| Azure SQL Server (Private + Entra-only) | `df-demofact-xfv37byc-sql` (`publicNetworkAccess: Disabled`, Entra Admin: `df-demofact-xfv37byc-uami`) |
+| Durable Task Scheduler | `https://df-demofact-xfv-c9cfa5bd.swedencentral.durabletask.io` (`Sidecar work-item streaming connection established`) |
+| Microsoft Foundry Project (`gpt-4.1-eu`) | `https://df-demofact-xfv37byc-foundry.services.ai.azure.com/api/projects/demo-factory-eu` (`DataZoneStandard`) |
+
+### Live Role Verification
+- Command: `az role assignment list --assignee-object-id 4eec2f7c-5e5b-4966-a544-db9bcc8ee790 --all -o table`
+- Results:
+  - `df-demofact-xfv37byc-uami` → `AcrPull` on `dfxfv37bycacr` ✅
+  - `df-demofact-xfv37byc-uami` → `Key Vault Crypto User` on `df-kv-xfv37byc` ✅
+  - `df-demofact-xfv37byc-uami` → `Storage Blob Data Contributor` on `dfevxfv37bycst` ✅
+  - `df-demofact-xfv37byc-uami` → `Durable Task Data Contributor` on `df-demofact-xfv37byc-dts` ✅
+  - `df-demofact-xfv37byc-uami` → `Foundry User`, `Cognitive Services OpenAI User`, `Cognitive Services User` on `df-demofact-xfv37byc-foundry` ✅
+  - `df-demofact-xfv37byc-uami` → Microsoft Entra SQL Server Administrator (`azureADOnlyAuthentication: true`) on `df-demofact-xfv37byc-sql` ✅
+- Status: Pass
+

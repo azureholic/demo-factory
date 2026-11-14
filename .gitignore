@@ -14,5 +14,5 @@ artifacts/
 TestResults/
 .env
 .env.local
-.azure/*/
+.azure/*
 !.azure/deployment-plan.md

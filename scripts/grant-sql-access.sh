@@ -43,11 +43,16 @@ while IFS= read -r line; do
   export "$key=$value"
 done <<< "$AZD_ENV"
 
-# Determine app identity name (App Service uses SERVICE_WEB_NAME, APIs use SERVICE_API_NAME)
-APP_NAME=${SERVICE_WEB_NAME:-${SERVICE_API_NAME:-}}
+if [ "${SQL_PUBLIC_ACCESS:-}" = "Disabled" ]; then
+  echo "SQL Server ${SQL_SERVER} uses Private Endpoint (publicNetworkAccess=Disabled) with Managed Identity ${MANAGED_IDENTITY_NAME} configured as Microsoft Entra SQL Administrator. Skipping external client SQL grant."
+  exit 0
+fi
+
+# Determine managed identity name (User-Assigned MANAGED_IDENTITY_NAME takes priority, then App Service / API name)
+APP_NAME=${MANAGED_IDENTITY_NAME:-${SERVICE_WEB_NAME:-${SERVICE_API_NAME:-}}}
 
 if [ -z "$APP_NAME" ]; then
-  echo "ERROR: Neither SERVICE_WEB_NAME nor SERVICE_API_NAME is set in azd environment." >&2
+  echo "ERROR: Neither MANAGED_IDENTITY_NAME, SERVICE_WEB_NAME, nor SERVICE_API_NAME is set in azd environment." >&2
   exit 1
 fi
 

@@ -50,11 +50,22 @@ foreach ($line in $AzdEnvironment) {
     }
 }
 
-# Determine app identity name (App Service uses SERVICE_WEB_NAME, APIs use SERVICE_API_NAME)
-$AppName = if ($env:SERVICE_WEB_NAME) { $env:SERVICE_WEB_NAME } else { $env:SERVICE_API_NAME }
+if ($env:SQL_PUBLIC_ACCESS -eq 'Disabled') {
+    Write-Host "SQL Server $($env:SQL_SERVER) uses Private Endpoint (publicNetworkAccess=Disabled) with Managed Identity $($env:MANAGED_IDENTITY_NAME) configured as Microsoft Entra SQL Administrator. Skipping external client SQL grant."
+    exit 0
+}
+
+# Determine managed identity name (User-Assigned MANAGED_IDENTITY_NAME takes priority, then App Service / API name)
+$AppName = if ($env:MANAGED_IDENTITY_NAME) {
+    $env:MANAGED_IDENTITY_NAME
+} elseif ($env:SERVICE_WEB_NAME) {
+    $env:SERVICE_WEB_NAME
+} else {
+    $env:SERVICE_API_NAME
+}
 
 if (-not $AppName) {
-    Write-Error "Neither SERVICE_WEB_NAME nor SERVICE_API_NAME is set in azd environment."
+    Write-Error "Neither MANAGED_IDENTITY_NAME, SERVICE_WEB_NAME, nor SERVICE_API_NAME is set in azd environment."
     exit 1
 }
 
@@ -105,23 +116,72 @@ IF NOT EXISTS (
 "@
 }
 
-# Ensure sqlcmd is available to execute the query
-if (-not (Get-Command sqlcmd -ErrorAction SilentlyContinue)) {
-    Write-Error "'sqlcmd' is not installed or not on PATH."
-    Write-Error "Install the modern go-sqlcmd from https://github.com/microsoft/go-sqlcmd and retry."
-    exit 1
+$TempFirewallRule = "TempPostProvisionClientIp"
+$AddedFirewallRule = $false
+
+try {
+    if ($env:AZURE_RESOURCE_GROUP -and $env:SQL_SERVER) {
+        try {
+            $ClientIp = (Invoke-RestMethod -Uri "https://api.ipify.org" -TimeoutSec 10).Trim()
+            if ($ClientIp -match '^\d{1,3}(\.\d{1,3}){3}$') {
+                Write-Host "Temporarily allowing client IP $ClientIp on SQL Server $($env:SQL_SERVER)..."
+                az sql server firewall-rule create `
+                  --resource-group $env:AZURE_RESOURCE_GROUP `
+                  --server $env:SQL_SERVER `
+                  --name $TempFirewallRule `
+                  --start-ip-address $ClientIp `
+                  --end-ip-address $ClientIp `
+                  --output none
+                if ($LASTEXITCODE -eq 0) { $AddedFirewallRule = $true }
+            }
+        }
+        catch {
+            Write-Warning "Could not determine or add temporary client IP firewall rule: $_"
+        }
+    }
+
+    $AccessToken = (az account get-access-token --resource "https://database.windows.net/" --query accessToken -o tsv).Trim()
+    if (-not $AccessToken) {
+        Write-Error "Failed to acquire Entra access token for Azure SQL Database via Azure CLI."
+        exit 1
+    }
+
+    $ConnStr = "Server=tcp:$($env:SQL_SERVER).database.windows.net,1433;Database=$($env:SQL_DATABASE);Encrypt=True;TrustServerCertificate=False;Connection Timeout=60;"
+    $MaxAttempts = 4
+    for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+        try {
+            $Conn = [System.Data.SqlClient.SqlConnection]::new($ConnStr)
+            $Conn.AccessToken = $AccessToken
+            $Conn.Open()
+            try {
+                $Cmd = $Conn.CreateCommand()
+                $Cmd.CommandTimeout = 120
+                $Cmd.CommandText = $SqlQuery
+                [void]$Cmd.ExecuteNonQuery()
+            }
+            finally {
+                $Conn.Dispose()
+            }
+            break
+        }
+        catch {
+            if ($attempt -eq $MaxAttempts) {
+                Write-Error "SQL grant query failed after $MaxAttempts attempts: $_"
+                exit 1
+            }
+            Write-Host "SQL database waking up or firewall propagating (attempt $attempt/$MaxAttempts); retrying in 10s..."
+            Start-Sleep -Seconds 10
+        }
+    }
+
+    Write-Host "SQL access granted successfully."
 }
-
-sqlcmd `
-  -S "$($env:SQL_SERVER).database.windows.net" `
-  -d $env:SQL_DATABASE `
-  --authentication-method ActiveDirectoryDefault `
-  -x -b `
-  -Q $SqlQuery
-
-if ($LASTEXITCODE -ne 0) {
-    Write-Error "sqlcmd failed with exit code $LASTEXITCODE. SQL access was not granted."
-    exit 1
+finally {
+    if ($AddedFirewallRule) {
+        az sql server firewall-rule delete `
+          --resource-group $env:AZURE_RESOURCE_GROUP `
+          --server $env:SQL_SERVER `
+          --name $TempFirewallRule `
+          --output none 2>$null
+    }
 }
-
-Write-Host "SQL access granted successfully."

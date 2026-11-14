@@ -20,6 +20,7 @@ COPY --from=dotnet-build /app/publish ./
 COPY --from=web-build /web/dist ./wwwroot
 COPY agents/ ./agents/
 COPY policies/ ./policies/
+COPY templates/ ./templates/
 ENV ASPNETCORE_URLS=http://+:8080
 EXPOSE 8080
 ENTRYPOINT ["dotnet", "DemoFactory.Api.dll"]
