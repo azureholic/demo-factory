@@ -46,6 +46,8 @@ public interface IGitHubGateway
     Task ApplyRulesetsAndSettingsAsync(string owner, string repo, IReadOnlyList<string> requiredChecks, CancellationToken ct = default);
     Task<(string ProjectId, int ProjectNumber)> CopyProjectBoardAsync(string owner, string repo, string title, CancellationToken ct = default);
     Task<CreatedIssueRef> CreateIssueAsync(string owner, string repo, string title, string body, IReadOnlyList<string> labels, CancellationToken ct = default);
+    Task UpdateIssueAsync(string owner, string repo, int issueNumber, string title, string body, CancellationToken ct = default);
+    Task UnlockConversationAsync(string owner, string repo, int issueOrPrNumber, CancellationToken ct = default);
     Task AddBlockedByDependencyAsync(string dependentIssueNodeId, string blockerIssueNodeId, CancellationToken ct = default);
     Task<string> AddIssueToProjectBoardAsync(string projectId, string issueNodeId, BoardStatus status, PriorityLevel priority, ItemSize size, string factoryState, string model, string? featureSlug, CancellationToken ct = default);
     Task UpdateProjectBoardItemAsync(string projectId, string itemId, BoardStatus status, string factoryState, int attempts, string agent, string model, CancellationToken ct = default);
@@ -599,6 +601,47 @@ public sealed class GitHubGateway(
 
         await auditLogger.RecordAsync(envOptions.Value.OwnerLogin, "IssueCreated", "Issue", $"{owner}/{repo}#{createdNumber}", after: new { title, labels }, issueNumber: createdNumber, ct: ct);
         return new CreatedIssueRef(createdNumber, createdNodeId, createdUrl);
+    }
+
+    public async Task UpdateIssueAsync(
+        string owner,
+        string repo,
+        int issueNumber,
+        string title,
+        string body,
+        CancellationToken ct = default)
+    {
+        await EnsureRepoAllowlistedAsync(owner, repo, ct);
+        await PaceWriteAsync(ct);
+
+        if (!IsSandbox)
+        {
+            using var http = await CreateDelegatedHttpAsync(ct);
+            await SendGitHubRestAsync(http, HttpMethod.Patch, $"/repos/{owner}/{repo}/issues/{issueNumber}", new
+            {
+                title,
+                body
+            }, ct);
+        }
+
+        await auditLogger.RecordAsync(
+            envOptions.Value.OwnerLogin,
+            "IssueUpdated",
+            "Issue",
+            $"{owner}/{repo}#{issueNumber}",
+            after: new { title },
+            issueNumber: issueNumber,
+            ct: ct);
+    }
+
+    public async Task UnlockConversationAsync(string owner, string repo, int issueOrPrNumber, CancellationToken ct = default)
+    {
+        await EnsureRepoAllowlistedAsync(owner, repo, ct);
+        if (IsSandbox)
+            return;
+
+        using var http = await CreateDelegatedHttpAsync(ct);
+        await TrySendGitHubRestAsync(http, HttpMethod.Delete, $"/repos/{owner}/{repo}/issues/{issueOrPrNumber}/lock", null, ct);
     }
 
     public async Task AddBlockedByDependencyAsync(string dependentIssueNodeId, string blockerIssueNodeId, CancellationToken ct = default)

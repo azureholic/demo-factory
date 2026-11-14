@@ -524,12 +524,83 @@ public sealed class FactoryEndToEndTests : IAsyncLifetime
             var issue = await gateway.CreateIssueAsync("azureholic", "live-test-repo", "Walking skeleton", "Body", ["factory"]);
             Assert.Equal(1, issue.Number);
             Assert.Contains("POST /repos/azureholic/live-test-repo/labels", recordedPaths);
+
+            await gateway.UnlockConversationAsync("azureholic", "live-test-repo", 1);
+            await gateway.UpdateIssueAsync("azureholic", "live-test-repo", 1, "Walking skeleton (clarified)", "Updated body");
+            Assert.Contains("DELETE /repos/azureholic/live-test-repo/issues/1/lock", recordedPaths);
+            Assert.Contains("PATCH /repos/azureholic/live-test-repo/issues/1", recordedPaths);
         }
         finally
         {
             if (File.Exists(isolatedDb)) { try { File.Delete(isolatedDb); } catch { } }
             if (Directory.Exists(isolatedDir)) { try { Directory.Delete(isolatedDir, recursive: true); } catch { } }
         }
+    }
+
+    [Fact]
+    public async Task EndToEnd_WorkItemClarify_And_SpecEdit_UpdatesBodyAndDispatchesToCopilot()
+    {
+        var createResp = await _client.PostAsJsonAsync("/api/projects", new
+        {
+            name = "Clarification Flow Demo",
+            specMarkdown = "# Clarification Flow Demo\n\n## Goals\n- Interactive browser beatbox sequencer.",
+            templateId = "dotnet-react",
+            autonomy = "L1",
+            codingModel = "gemini-4-carbon"
+        });
+        Assert.Equal(HttpStatusCode.Created, createResp.StatusCode);
+        var created = await createResp.Content.ReadFromJsonAsync<JsonElement>();
+        var projectId = created.GetProperty("project").GetProperty("id").GetGuid();
+
+        await _client.PostAsJsonAsync($"/api/projects/{projectId}:clarify", new { answers = new Dictionary<string, string>(), dismissPublicSafeFlags = true });
+        var approveResp = await _client.PostAsync($"/api/projects/{projectId}:approve", null);
+        Assert.Equal(HttpStatusCode.OK, approveResp.StatusCode);
+
+        var repos = await _client.GetFromJsonAsync<JsonElement>("/api/repos");
+        var repoId = repos.EnumerateArray().First(r => r.GetProperty("projectId").GetGuid() == projectId).GetProperty("id").GetGuid();
+
+        // Force an unstarted work item into NeedsClarification with an empty body (which would otherwise fail ReviewSpecAsync again)
+        Guid targetWorkItemId;
+        var dbFactory = _factory.Services.GetRequiredService<IDbContextFactory<DemoFactoryDbContext>>();
+        await using (var db = await dbFactory.CreateDbContextAsync())
+        {
+            var wi = await db.WorkItems.OrderBy(w => w.IssueNumber).FirstAsync(w => w.RepoId == repoId);
+            targetWorkItemId = wi.Id;
+            wi.State = WorkItemStateKind.NeedsClarification;
+            wi.BoardStatus = BoardStatus.Blocked;
+            wi.PmVerdict = "NeedsClarification";
+            wi.BlockedReason = "Should /healthz return JSON?";
+            wi.BodyMarkdown = "";
+            wi.AcceptanceCriteriaJson = "[]";
+            wi.BlockedByIssueNumbersJson = "[]";
+            await db.SaveChangesAsync();
+        }
+
+        // 1. Update specification & acceptance criteria in-app via PUT /api/workitems/{id}/spec
+        var putSpecResp = await _client.PutAsJsonAsync($"/api/workitems/{targetWorkItemId}/spec", new
+        {
+            title = "Walking skeleton: Scaffold dotnet-react & health probe",
+            bodyMarkdown = "Scaffold the .NET 11 + React 19 walking skeleton.",
+            acceptanceCriteria = new[] { "GET /healthz returns 200 OK JSON", "Frontend renders sequencer grid" }
+        });
+        Assert.Equal(HttpStatusCode.OK, putSpecResp.StatusCode);
+
+        // 2. Submit operator clarification via POST /api/workitems/{id}:clarify -> dispatches directly to Implementing!
+        var clarifyResp = await _client.PostAsJsonAsync($"/api/workitems/{targetWorkItemId}:clarify", new
+        {
+            clarificationMarkdown = "Return {\"status\":\"healthy\"} on GET /healthz and keep seed data in memory.",
+            proceedWithDefaults = false
+        });
+        Assert.Equal(HttpStatusCode.OK, clarifyResp.StatusCode);
+
+        // 3. Verify GET /api/workitems/{id} shows updated spec, issueUrl, cleared block, and Implementing state
+        var detail = await _client.GetFromJsonAsync<JsonElement>($"/api/workitems/{targetWorkItemId}");
+        var wiDto = detail.GetProperty("workItem");
+        Assert.Equal("Implementing", wiDto.GetProperty("state").GetString());
+        Assert.Equal("Ready", wiDto.GetProperty("pmVerdict").GetString());
+        Assert.Contains("github.com/", wiDto.GetProperty("issueUrl").GetString());
+        Assert.Contains("Operator Clarification", wiDto.GetProperty("bodyMarkdown").GetString());
+        Assert.Equal(2, wiDto.GetProperty("acceptanceCriteria").GetArrayLength());
     }
 
     private static HttpResponseMessage StubJson(HttpStatusCode code, object payload) =>

@@ -289,6 +289,16 @@ export const api = {
   getWorkItem: (id: string) => request<any>(`/api/workitems/${id}`),
   workItemAction: (id: string, action: string, body?: any) =>
     request<any>(`/api/workitems/${id}:${action}`, { method: 'POST', body: body ? JSON.stringify(body) : undefined }),
+  clarifyWorkItem: (id: string, clarificationMarkdown: string, proceedWithDefaults = false) =>
+    request<any>(`/api/workitems/${id}:clarify`, {
+      method: 'POST',
+      body: JSON.stringify({ clarificationMarkdown, proceedWithDefaults })
+    }),
+  updateWorkItemSpec: (id: string, payload: { title: string; bodyMarkdown: string; acceptanceCriteria: string[] }) =>
+    request<any>(`/api/workitems/${id}/spec`, {
+      method: 'PUT',
+      body: JSON.stringify(payload)
+    }),
   updateWorkItemSettings: (id: string, codingModel: string | null) =>
     request<any>(`/api/workitems/${id}/settings`, { method: 'PUT', body: JSON.stringify({ codingModel }) }),
 

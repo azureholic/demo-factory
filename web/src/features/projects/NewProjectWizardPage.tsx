@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from 'react';
+import React, { useState } from 'react';
 import {
   Badge,
   Button,
@@ -14,9 +14,9 @@ import {
 } from '@fluentui/react-components';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useNavigate } from 'react-router-dom';
-import { Background, Edge, MarkerType, Node, ReactFlow } from '@xyflow/react';
-import { GeneratedPlan, PlannedBacklogItem, api } from '../../api/client';
+import { GeneratedPlan, api } from '../../api/client';
 import { OperationProgressBanner, StatusPill } from '../../components/SharedComponents';
+import { PlanCanvasEditor } from './PlanCanvasEditor';
 
 export const NewProjectWizardPage: React.FC = () => {
   const navigate = useNavigate();
@@ -111,58 +111,6 @@ export const NewProjectWizardPage: React.FC = () => {
     const text = await file.text();
     setSpecMarkdown(prev => `${prev}\n\n${text}`);
   };
-
-  const updateItem = (idx: number, patch: Partial<PlannedBacklogItem>) => {
-    if (!plan) return;
-    const items = plan.items.map((it, i) => (i === idx ? { ...it, ...patch } : it));
-    const next = {
-      ...plan,
-      items,
-      estimatedCostUsd: Number((items.length * 0.65).toFixed(2)),
-      estimatedDurationMinutes: items.length * 14
-    };
-    setPlan(next);
-  };
-
-  const deleteItem = (idx: number) => {
-    if (!plan) return;
-    const removedKey = plan.items[idx].key;
-    const items = plan.items
-      .filter((_, i) => i !== idx)
-      .map(it => ({ ...it, blockedByKeys: it.blockedByKeys.filter(k => k !== removedKey) }));
-    setPlan({
-      ...plan,
-      items,
-      estimatedCostUsd: Number((items.length * 0.65).toFixed(2)),
-      estimatedDurationMinutes: items.length * 14
-    });
-  };
-
-  const planGraph = useMemo(() => {
-    const items = plan?.items ?? [];
-    const nodes: Node[] = items.map((it, idx) => ({
-      id: it.key,
-      position: { x: (idx % 2) * 240 + 20, y: Math.floor(idx / 2) * 105 + 20 },
-      data: { label: `${it.key}: ${it.title.slice(0, 34)}` },
-      style: {
-        width: 215,
-        fontSize: 11,
-        borderRadius: 6,
-        border: it.isAcceptanceTest ? '2px solid #8b5cf6' : '2px solid #2b82f0',
-        background: tokens.colorNeutralBackground1,
-        color: tokens.colorNeutralForeground1
-      }
-    }));
-    const edges: Edge[] = items.flatMap(it =>
-      it.blockedByKeys.map(b => ({
-        id: `${b}->${it.key}`,
-        source: b,
-        target: it.key,
-        markerEnd: { type: MarkerType.ArrowClosed }
-      }))
-    );
-    return { nodes, edges };
-  }, [plan]);
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
@@ -441,77 +389,7 @@ export const NewProjectWizardPage: React.FC = () => {
             ]}
           />
 
-          <div style={{ display: 'grid', gridTemplateColumns: '1.4fr 1fr', gap: 14 }}>
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-              {plan.items.map((item, idx) => {
-                const missingCriteria = item.acceptanceCriteria.length === 0;
-                const oversized = item.size === 'XLarge';
-                return (
-                  <div
-                    key={item.key}
-                    style={{
-                      padding: 10,
-                      borderRadius: 8,
-                      background: tokens.colorNeutralBackground2,
-                      display: 'flex',
-                      flexDirection: 'column',
-                      gap: 6
-                    }}
-                  >
-                    <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-                      <Badge appearance="tint" color={item.isAcceptanceTest ? 'important' : 'brand'}>
-                        {item.key} {item.isAcceptanceTest ? '(AT)' : ''}
-                      </Badge>
-                      <Input
-                        style={{ flex: 1 }}
-                        value={item.title}
-                        onChange={(_, d) => updateItem(idx, { title: d.value })}
-                      />
-                      <Dropdown
-                        style={{ minWidth: 95 }}
-                        value={item.size}
-                        onOptionSelect={(_, d) => d.optionValue && updateItem(idx, { size: d.optionValue as any })}
-                      >
-                        <Option value="Small">Small</Option>
-                        <Option value="Medium">Medium</Option>
-                        <Option value="Large">Large</Option>
-                        <Option value="XLarge">XLarge</Option>
-                      </Dropdown>
-                      <Dropdown
-                        style={{ minWidth: 100 }}
-                        value={item.priority}
-                        onOptionSelect={(_, d) => d.optionValue && updateItem(idx, { priority: d.optionValue as any })}
-                      >
-                        <Option value="Critical">Critical</Option>
-                        <Option value="High">High</Option>
-                        <Option value="Medium">Medium</Option>
-                        <Option value="Low">Low</Option>
-                      </Dropdown>
-                      <Button size="small" appearance="subtle" onClick={() => deleteItem(idx)}>
-                        Remove
-                      </Button>
-                    </div>
-                    {(missingCriteria || oversized) && (
-                      <Text size={200} style={{ color: tokens.colorPaletteRedForeground1 }}>
-                        {missingCriteria ? '⚠ Missing acceptance criteria. ' : ''}
-                        {oversized ? '⚠ Item is XLarge; consider splitting.' : ''}
-                      </Text>
-                    )}
-                    <Text size={200} style={{ color: tokens.colorNeutralForeground3 }}>
-                      Requirements: {item.requirementIds.join(', ')} · Blocked by:{' '}
-                      {item.blockedByKeys.length > 0 ? item.blockedByKeys.join(', ') : 'None'}
-                    </Text>
-                  </div>
-                );
-              })}
-            </div>
-
-            <div style={{ height: 440, borderRadius: 8, overflow: 'hidden', border: `1px solid ${tokens.colorNeutralStroke2}` }}>
-              <ReactFlow nodes={planGraph.nodes} edges={planGraph.edges} fitView>
-                <Background />
-              </ReactFlow>
-            </div>
-          </div>
+          <PlanCanvasEditor plan={plan} onChange={setPlan} />
         </Card>
       )}
 

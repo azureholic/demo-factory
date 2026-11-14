@@ -23,6 +23,8 @@ public sealed record OnboardRepositoryRequest(
     string CodingModel = "gemini-4-carbon");
 
 public sealed record WaiveFindingRequest(string Fingerprint, string Reason);
+public sealed record ClarifyWorkItemRequest(string? ClarificationMarkdown, bool ProceedWithDefaults = false);
+public sealed record UpdateWorkItemSpecRequest(string Title, string? BodyMarkdown, IReadOnlyList<string>? AcceptanceCriteria);
 public sealed record ApprovalDecisionRequest(string? Reason);
 public sealed record MoveBoardCardRequest(BoardStatus ToStatus);
 public sealed record SimulateLineStopRequest(string Cause, IReadOnlyList<int> SuspectPrNumbers, bool FlakeRetryPassed = false);
@@ -429,6 +431,10 @@ public static class OperationsAndGovernanceEndpoints
             if (wi is null)
                 return Results.NotFound();
 
+            var repo = await db.Repositories.FirstOrDefaultAsync(r => r.Id == wi.RepoId, ct);
+            var issueUrl = repo is not null && wi.IssueNumber > 0
+                ? $"https://github.com/{repo.Owner}/{repo.Name}/issues/{wi.IssueNumber}"
+                : null;
             var sessions = await db.AgentSessions.Where(s => s.WorkItemId == id).OrderByDescending(s => s.StartedAt).ToListAsync(ct);
             var rounds = await db.ReviewRounds.Where(r => r.WorkItemId == id).OrderBy(r => r.Round).ToListAsync(ct);
             var findings = await db.Findings.Where(f => f.WorkItemId == id).ToListAsync(ct);
@@ -451,7 +457,9 @@ public static class OperationsAndGovernanceEndpoints
                 {
                     wi.Id,
                     wi.RepoId,
+                    repoFullName = repo?.FullName,
                     wi.IssueNumber,
+                    issueUrl,
                     wi.Title,
                     wi.BodyMarkdown,
                     acceptanceCriteria = JsonSerializer.Deserialize<List<string>>(wi.AcceptanceCriteriaJson, JsonOpts) ?? [],
@@ -493,10 +501,62 @@ public static class OperationsAndGovernanceEndpoints
             });
         }).RequireAuthorization(FactoryRoles.ViewerPolicy);
 
-        // Operator actions: :retry · :cancel · :unblock · :waive-finding · :mark-ready · :approve · :request-changes · :move-board
+        // Edit Work Item Specification & Acceptance Criteria (syncs directly to GitHub Issue)
+        app.MapPut("/api/workitems/{id:guid}/spec", async (
+            Guid id,
+            UpdateWorkItemSpecRequest req,
+            HttpContext http,
+            IGitHubGateway gitHub,
+            IDbContextFactory<DemoFactoryDbContext> dbFactory,
+            IAuditLogger auditLogger,
+            IRealtimeNotifier notifier,
+            CancellationToken ct) =>
+        {
+            if (string.IsNullOrWhiteSpace(req.Title))
+                return Results.BadRequest(new { error = "Title is required." });
+
+            await using var db = await dbFactory.CreateDbContextAsync(ct);
+            var wi = await db.WorkItems.FirstOrDefaultAsync(w => w.Id == id, ct);
+            if (wi is null)
+                return Results.NotFound();
+
+            var repo = await db.Repositories.FirstOrDefaultAsync(r => r.Id == wi.RepoId, ct);
+            var actor = http.User.Identity?.Name ?? "operator";
+            var criteria = (req.AcceptanceCriteria ?? [])
+                .Select(c => c?.Trim() ?? string.Empty)
+                .Where(c => c.Length > 0)
+                .ToList();
+
+            wi.Title = req.Title.Trim();
+            wi.BodyMarkdown = (req.BodyMarkdown ?? string.Empty).Trim();
+            wi.AcceptanceCriteriaJson = JsonSerializer.Serialize(criteria, JsonOpts);
+            wi.UpdatedAt = DateTimeOffset.UtcNow;
+            await db.SaveChangesAsync(ct);
+
+            if (repo is not null && wi.IssueNumber > 0)
+            {
+                var ghBody = FactoryOrchestrationCoordinator.FormatGitHubIssueBody(wi.BodyMarkdown, criteria);
+                await gitHub.UnlockConversationAsync(repo.Owner, repo.Name, wi.IssueNumber, ct);
+                await gitHub.UpdateIssueAsync(repo.Owner, repo.Name, wi.IssueNumber, wi.Title, ghBody, ct);
+            }
+
+            await auditLogger.RecordAsync(actor, "WorkItemSpecUpdated", "WorkItem", wi.Id.ToString(), after: new { wi.Title, criteriaCount = criteria.Count }, issueNumber: wi.IssueNumber, ct: ct);
+            await notifier.BroadcastWorkItemChangedAsync(wi.Id, wi.RepoId, wi.State.ToString(), ct);
+            return Results.Ok(new
+            {
+                wi.Id,
+                wi.Title,
+                wi.BodyMarkdown,
+                acceptanceCriteria = criteria,
+                wi.UpdatedAt
+            });
+        }).RequireAuthorization(FactoryRoles.OperatorPolicy);
+
+        // Operator actions: :retry · :cancel · :unblock · :clarify · :waive-finding · :mark-ready · :approve · :request-changes · :move-board
         app.MapPost("/api/workitems/{target}", async (
             string target,
             HttpContext http,
+            IGitHubGateway gitHub,
             IFactoryOrchestrationCoordinator coordinator,
             IOrchestrationActivities activities,
             IDbContextFactory<DemoFactoryDbContext> dbFactory,
@@ -518,8 +578,72 @@ public static class OperationsAndGovernanceEndpoints
 
             switch (action.ToLowerInvariant())
             {
+                case "clarify":
+                    var clarifyReq = await ProjectAndFeatureEndpoints.ReadJsonOrDefaultAsync<ClarifyWorkItemRequest>(http.Request, ct);
+                    var note = clarifyReq?.ClarificationMarkdown?.Trim();
+                    var prevQuestions = wi.BlockedReason;
+
+                    if (!string.IsNullOrWhiteSpace(note))
+                    {
+                        var sectionHeader = $"## Operator Clarification ({DateTimeOffset.UtcNow:yyyy-MM-dd HH:mm} UTC)";
+                        var qaBlock = !string.IsNullOrWhiteSpace(prevQuestions)
+                            ? $"{sectionHeader}\n> **Previous questions:** {prevQuestions}\n\n{note}"
+                            : $"{sectionHeader}\n\n{note}";
+                        wi.BodyMarkdown = string.IsNullOrWhiteSpace(wi.BodyMarkdown)
+                            ? qaBlock
+                            : $"{wi.BodyMarkdown.TrimEnd()}\n\n{qaBlock}";
+                    }
+                    else if (clarifyReq?.ProceedWithDefaults == true)
+                    {
+                        var defaultNote = "## Operator Clarification\n\nApply standard golden-path template conventions and sensible defaults for any unspecified implementation details.";
+                        if (!wi.BodyMarkdown.Contains("Apply standard golden-path template conventions", StringComparison.OrdinalIgnoreCase))
+                        {
+                            wi.BodyMarkdown = string.IsNullOrWhiteSpace(wi.BodyMarkdown)
+                                ? defaultNote
+                                : $"{wi.BodyMarkdown.TrimEnd()}\n\n{defaultNote}";
+                        }
+                    }
+
+                    foreach (var openSession in await db.AgentSessions.Where(s => s.WorkItemId == wi.Id && s.EndedAt == null).ToListAsync(ct))
+                    {
+                        openSession.State = CopilotTaskState.Cancelled;
+                        openSession.EndedAt = DateTimeOffset.UtcNow;
+                    }
+
+                    wi.PmVerdict = "OperatorReady";
+                    wi.State = WorkItemStateKind.Queued;
+                    wi.BoardStatus = BoardStatus.Ready;
+                    wi.BlockedReason = null;
+                    wi.ReadyAt ??= DateTimeOffset.UtcNow;
+                    wi.UpdatedAt = DateTimeOffset.UtcNow;
+                    await db.SaveChangesAsync(ct);
+
+                    var clarifyRepo = await db.Repositories.FirstOrDefaultAsync(r => r.Id == wi.RepoId, ct);
+                    if (clarifyRepo is not null && wi.IssueNumber > 0)
+                    {
+                        var criteria = JsonSerializer.Deserialize<List<string>>(wi.AcceptanceCriteriaJson, JsonOpts) ?? [];
+                        var ghBody = FactoryOrchestrationCoordinator.FormatGitHubIssueBody(wi.BodyMarkdown, criteria);
+                        await gitHub.UnlockConversationAsync(clarifyRepo.Owner, clarifyRepo.Name, wi.IssueNumber, ct);
+                        await gitHub.UpdateIssueAsync(clarifyRepo.Owner, clarifyRepo.Name, wi.IssueNumber, wi.Title, ghBody, ct);
+                        var ghComment = !string.IsNullOrWhiteSpace(note)
+                            ? $"### Clarification Provided by @{actor}\n\n{note}\n\n_Issue updated and re-queued for implementation._"
+                            : $"### Approved to Proceed With Golden-Path Defaults (@{actor})\n\n_Re-queued for implementation._";
+                        await gitHub.PostCommentAsync(clarifyRepo.Owner, clarifyRepo.Name, wi.IssueNumber, ghComment, ct);
+                    }
+
+                    await auditLogger.RecordAsync(actor, "WorkItemClarified", "WorkItem", wi.Id.ToString(), before: new { prevState, prevQuestions }, after: new { wi.State, hasNote = !string.IsNullOrWhiteSpace(note) }, issueNumber: wi.IssueNumber, ct: ct);
+                    await coordinator.TriggerSchedulerAsync(wi.RepoId, ct);
+                    return Results.Ok(new { wi.Id, state = wi.State, boardStatus = wi.BoardStatus });
+
                 case "retry":
                 case "unblock":
+                    foreach (var openSession in await db.AgentSessions.Where(s => s.WorkItemId == wi.Id && s.EndedAt == null).ToListAsync(ct))
+                    {
+                        openSession.State = CopilotTaskState.Cancelled;
+                        openSession.EndedAt = DateTimeOffset.UtcNow;
+                    }
+
+                    wi.PmVerdict = "OperatorReady";
                     wi.State = WorkItemStateKind.Queued;
                     wi.BoardStatus = BoardStatus.Ready;
                     wi.BlockedReason = null;

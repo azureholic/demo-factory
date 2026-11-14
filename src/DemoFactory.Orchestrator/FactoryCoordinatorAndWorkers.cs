@@ -68,6 +68,17 @@ public sealed class FactoryOrchestrationCoordinator(
         await using var db = await dbFactory.CreateDbContextAsync(ct);
         var wi = await db.WorkItems.FirstAsync(w => w.Id == workItemId, ct);
 
+        // If an operator already explicitly approved/clarified this work item as Ready, honor that decision directly
+        if (string.Equals(wi.PmVerdict, "OperatorReady", StringComparison.OrdinalIgnoreCase))
+        {
+            wi.State = WorkItemStateKind.SpecReview;
+            wi.PmVerdict = "Ready";
+            wi.UpdatedAt = DateTimeOffset.UtcNow;
+            await db.SaveChangesAsync(ct);
+            await notifier.BroadcastWorkItemChangedAsync(wi.Id, wi.RepoId, wi.State.ToString(), ct);
+            return new SpecReviewOutput("Ready", [], []);
+        }
+
         var criteria = SafeDeserializeList<string>(wi.AcceptanceCriteriaJson);
         var blockers = SafeDeserializeList<int>(wi.BlockedByIssueNumbersJson);
         var review = await pmAgent.ReviewSpecAsync(new IssueSpecInput(wi.IssueNumber, wi.Title, wi.BodyMarkdown, criteria, wi.Size, blockers), ct: ct);
@@ -82,13 +93,12 @@ public sealed class FactoryOrchestrationCoordinator(
 
     public async Task MarkNeedsClarificationActivityAsync(Guid workItemId, IReadOnlyList<string> questions, CancellationToken ct = default)
     {
-        var idemKey = $"{workItemId}:NeedsClarification:{string.Join("|", questions)}";
-        if (!_completedIdempotencyKeys.TryAdd(idemKey, true))
-            return;
-
         await using var db = await dbFactory.CreateDbContextAsync(ct);
         var wi = await db.WorkItems.FirstAsync(w => w.Id == workItemId, ct);
         var repo = await db.Repositories.FirstAsync(r => r.Id == wi.RepoId, ct);
+
+        var alreadyPostedSame = wi.State == WorkItemStateKind.NeedsClarification
+            && string.Equals(wi.BlockedReason, string.Join(" ", questions), StringComparison.Ordinal);
 
         wi.State = WorkItemStateKind.NeedsClarification;
         wi.BoardStatus = BoardStatus.Blocked;
@@ -96,9 +106,12 @@ public sealed class FactoryOrchestrationCoordinator(
         wi.UpdatedAt = DateTimeOffset.UtcNow;
         await db.SaveChangesAsync(ct);
 
-        var comment = "### Clarification Needed Before Implementation\n\n" + string.Join("\n", questions.Select(q => $"- {q}"));
-        await gitHub.PostCommentAsync(repo.Owner, repo.Name, wi.IssueNumber, comment, ct);
-        await gitHub.UpdateProjectBoardItemAsync(repo.GitHubProjectId, wi.ProjectItemId, BoardStatus.Blocked, "NeedsClarification", wi.Attempts, "pm-agent", wi.CodingModel, ct);
+        if (!alreadyPostedSame)
+        {
+            var comment = "### Clarification Needed Before Implementation\n\n" + string.Join("\n", questions.Select(q => $"- {q}"));
+            await gitHub.PostCommentAsync(repo.Owner, repo.Name, wi.IssueNumber, comment, ct);
+            await gitHub.UpdateProjectBoardItemAsync(repo.GitHubProjectId, wi.ProjectItemId, BoardStatus.Blocked, "NeedsClarification", wi.Attempts, "pm-agent", wi.CodingModel, ct);
+        }
         await notifier.BroadcastWorkItemChangedAsync(wi.Id, wi.RepoId, wi.State.ToString(), ct);
     }
 
@@ -660,7 +673,10 @@ public sealed class FactoryOrchestrationCoordinator(
 
             try
             {
-                await ClaimAndAssignToCopilotActivityAsync(sel.Candidate.WorkItemId, 1, ct);
+                var nextAttempt = sel.Candidate.WorkItemId != Guid.Empty
+                    ? (allWorkItems.FirstOrDefault(w => w.Id == sel.Candidate.WorkItemId)?.Attempts ?? 0) + 1
+                    : 1;
+                await ClaimAndAssignToCopilotActivityAsync(sel.Candidate.WorkItemId, nextAttempt, ct);
                 started.Add(sel.Candidate.WorkItemId);
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
@@ -817,7 +833,8 @@ public sealed class FactoryOrchestrationCoordinator(
                 if (item.IsAcceptanceTest)
                     labels.Add("acceptance-test");
 
-                var createdIssue = await gitHub.CreateIssueAsync(owner, repoName, item.Title, item.Description, labels, ct);
+                var formattedBody = FormatGitHubIssueBody(item.Description, item.AcceptanceCriteria);
+                var createdIssue = await gitHub.CreateIssueAsync(owner, repoName, item.Title, formattedBody, labels, ct);
                 var boardItemId = await gitHub.AddIssueToProjectBoardAsync(projId, createdIssue.NodeId, item.InitialStatus, item.Priority, item.Size, "Queued", project.DefaultCodingModel, null, ct);
 
                 var wi = new WorkItemEntity
@@ -997,7 +1014,8 @@ public sealed class FactoryOrchestrationCoordinator(
                 if (item.IsAcceptanceTest)
                     labels.Add("acceptance-test");
 
-                var created = await gitHub.CreateIssueAsync(repo.Owner, repo.Name, item.Title, item.Description, labels, ct);
+                var formattedBody = FormatGitHubIssueBody(item.Description, item.AcceptanceCriteria);
+                var created = await gitHub.CreateIssueAsync(repo.Owner, repo.Name, item.Title, formattedBody, labels, ct);
                 var model = feature.CodingModelOverride ?? project.DefaultCodingModel;
                 var boardItemId = await gitHub.AddIssueToProjectBoardAsync(repo.GitHubProjectId, created.NodeId, item.InitialStatus, item.Priority, item.Size, "Queued", model, feature.Slug, ct);
 
@@ -1613,6 +1631,22 @@ public sealed class FactoryOrchestrationCoordinator(
             ev.ProcessedAt = DateTimeOffset.UtcNow;
             await db.SaveChangesAsync(ct);
         }
+    }
+
+    public static string FormatGitHubIssueBody(string? bodyMarkdown, IReadOnlyList<string>? acceptanceCriteria)
+    {
+        var body = (bodyMarkdown ?? string.Empty).Trim();
+        var criteria = (acceptanceCriteria ?? [])
+            .Where(c => !string.IsNullOrWhiteSpace(c))
+            .ToList();
+
+        if (criteria.Count == 0 || body.Contains("## Acceptance Criteria", StringComparison.OrdinalIgnoreCase))
+            return body;
+
+        var checklist = string.Join("\n", criteria.Select(c => $"- [ ] {c.Trim()}"));
+        return string.IsNullOrWhiteSpace(body)
+            ? $"## Acceptance Criteria\n{checklist}"
+            : $"{body}\n\n## Acceptance Criteria\n{checklist}";
     }
 
     private static List<T> SafeDeserializeList<T>(string? json)
