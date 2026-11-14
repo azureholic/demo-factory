@@ -3,6 +3,7 @@ using System.Net.Http.Json;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
 using Azure.AI.Projects;
 using Azure.Core;
@@ -222,7 +223,8 @@ public sealed partial class ProjectManagerAgent(
 {
     private static readonly JsonSerializerOptions JsonOpts = new(JsonSerializerDefaults.Web)
     {
-        PropertyNameCaseInsensitive = true
+        PropertyNameCaseInsensitive = true,
+        Converters = { new JsonStringEnumConverter() }
     };
 
     public PublicSafeCheckOutput CheckPublicSafeDeterministic(string markdown)
@@ -1135,13 +1137,39 @@ public sealed partial class ProjectManagerAgent(
         return new DraftedFeatureOutput(cleanTitle, slug, sb.ToString(), issues.Select(i => i.IssueNumber).ToList());
     }
 
-    private static List<string> ExtractBulletLines(string markdown) =>
-        markdown.Split('\n')
-            .Select(l => l.Trim())
-            .Where(l => l.StartsWith("- ", StringComparison.Ordinal) || l.StartsWith("* ", StringComparison.Ordinal))
-            .Select(l => l[2..].Trim())
-            .Where(l => l.Length > 3 && !l.StartsWith("[0", StringComparison.Ordinal))
-            .ToList();
+    private static List<string> ExtractBulletLines(string markdown)
+    {
+        var result = new List<string>();
+        var skipSection = false;
+
+        foreach (var rawLine in markdown.Split('\n'))
+        {
+            var line = rawLine.Trim();
+            if (line.StartsWith('#'))
+            {
+                skipSection = line.Contains("Out of Scope", StringComparison.OrdinalIgnoreCase)
+                    || line.Contains("Non-Goals", StringComparison.OrdinalIgnoreCase)
+                    || line.Contains("Clarifications", StringComparison.OrdinalIgnoreCase);
+                continue;
+            }
+
+            if (skipSection)
+                continue;
+
+            if (line.StartsWith("- ", StringComparison.Ordinal) || line.StartsWith("* ", StringComparison.Ordinal))
+            {
+                var bullet = line[2..].Trim();
+                if (bullet.Length > 3
+                    && !bullet.StartsWith("[0", StringComparison.Ordinal)
+                    && !bullet.Contains("Out of Scope", StringComparison.OrdinalIgnoreCase))
+                {
+                    result.Add(bullet);
+                }
+            }
+        }
+
+        return result;
+    }
 
     private static string TruncateTitle(string text) =>
         text.Length <= 68 ? text : text[..65].TrimEnd() + "...";

@@ -3,13 +3,14 @@ import {
   Badge,
   Button,
   Card,
+  Spinner,
   Textarea,
   Text,
   tokens
 } from '@fluentui/react-components';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { api } from '../../api/client';
-import { EmptyState, PageSkeleton, StatusPill } from '../../components/SharedComponents';
+import { EmptyState, OperationProgressBanner, PageSkeleton, StatusPill } from '../../components/SharedComponents';
 
 export const SpecPage: React.FC<{ projectId?: string }> = ({ projectId }) => {
   const qc = useQueryClient();
@@ -82,12 +83,25 @@ export const SpecPage: React.FC<{ projectId?: string }> = ({ projectId }) => {
         </div>
         <Button
           appearance="primary"
+          icon={saveSpecMutation.isPending ? <Spinner size="tiny" /> : undefined}
           disabled={saveSpecMutation.isPending}
           onClick={() => saveSpecMutation.mutate()}
         >
-          Save Spec Edit & Propose Backlog Delta
+          {saveSpecMutation.isPending
+            ? 'Analyzing Spec Delta…'
+            : 'Save Spec Edit & Propose Backlog Delta'}
         </Button>
       </div>
+
+      <OperationProgressBanner
+        active={saveSpecMutation.isPending || applyProposalMutation.isPending}
+        title={
+          saveSpecMutation.isPending
+            ? 'Analyzing specification changes & computing backlog delta…'
+            : 'Applying approved specification change proposal…'
+        }
+        subtitle="Microsoft Foundry orchestrator-model (MAI-Thinking-1) is comparing specification versions against open and completed work items."
+      />
 
       {errorMsg && (
         <Card style={{ padding: 12, background: tokens.colorPaletteRedBackground1 }}>

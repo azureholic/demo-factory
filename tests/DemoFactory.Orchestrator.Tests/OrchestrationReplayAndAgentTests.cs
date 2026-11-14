@@ -264,6 +264,44 @@ public sealed class OrchestrationReplayAndAgentTests
         Assert.Equal(1, thinkingTransport.CallCount);
         Assert.Equal("Ready", resThink.Verdict);
 
+        // MAI-Thinking-1 GeneratePlanAsync with string enum values ("Small", "Critical", "Ready") deserializes on attempt 1 without fallback
+        var planTransport = new FlakyJsonModelTransport(
+            """
+            <think>Planning browser-beatbox backlog...</think>
+            {
+              "adr0001Markdown": "# ADR-0001: Browser Beatbox Architecture\nWeb Audio API synthesizer.",
+              "requirements": [{ "id": "REQ-001", "text": "16-step drum sequencer grid" }],
+              "milestones": ["M1: Walking Skeleton"],
+              "items": [{
+                "key": "ISS-1",
+                "title": "Walking skeleton: browser-beatbox",
+                "description": "Bootstrap app",
+                "acceptanceCriteria": ["Renders 16-step grid"],
+                "requirementIds": ["REQ-001"],
+                "size": "Small",
+                "priority": "Critical",
+                "milestone": "M1: Walking Skeleton",
+                "isAcceptanceTest": false,
+                "blockedByKeys": [],
+                "blockedByExistingIssueNumbers": [],
+                "predictedTouchPaths": ["web/"],
+                "initialStatus": "Ready"
+              }],
+              "estimatedCostUsd": 1.25,
+              "estimatedDurationMinutes": 20
+            }
+            """);
+        var pmPlan = new ProjectManagerAgent(
+            planTransport,
+            new NullPmTraceSink(),
+            Options.Create(new FoundryAgentOptions()),
+            NullLogger<ProjectManagerAgent>.Instance);
+        var parsedPlan = await pmPlan.GeneratePlanAsync("browser-beatbox", "# Spec", "dotnet-react");
+        Assert.Equal(1, planTransport.CallCount);
+        Assert.Single(parsedPlan.Items);
+        Assert.Equal(ItemSize.Small, parsedPlan.Items[0].Size);
+        Assert.Equal(PriorityLevel.Critical, parsedPlan.Items[0].Priority);
+
         // Both attempts invalid -> deterministic fallback kicks in cleanly
         var brokenTransport = new FlakyJsonModelTransport("broken-1", """{"verdict": "INVALID_ENUM"}""");
         var pm2 = new ProjectManagerAgent(

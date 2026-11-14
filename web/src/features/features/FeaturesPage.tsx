@@ -6,13 +6,14 @@ import {
   Dropdown,
   Input,
   Option,
+  Spinner,
   Textarea,
   Text,
   tokens
 } from '@fluentui/react-components';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { api } from '../../api/client';
-import { EmptyState, PageSkeleton, StatusPill } from '../../components/SharedComponents';
+import { EmptyState, OperationProgressBanner, PageSkeleton, StatusPill } from '../../components/SharedComponents';
 
 export const FeaturesPage: React.FC<{ projectId?: string; repoId?: string }> = ({ projectId, repoId }) => {
   const qc = useQueryClient();
@@ -127,13 +128,24 @@ export const FeaturesPage: React.FC<{ projectId?: string; repoId?: string }> = (
                 value={specMd}
                 onChange={(_, d) => setSpecMd(d.value)}
               />
+              <OperationProgressBanner
+                active={createMutation.isPending}
+                title="Analyzing feature specification against running project…"
+                subtitle="Checking overlap with existing requirements, open work items, and public-safe hygiene."
+                phases={[
+                  'Comparing feature scope against existing REQ-xxx requirements',
+                  'Running public-repo hygiene check',
+                  'Preparing clarifying checks'
+                ]}
+              />
               <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
                 <Button
                   appearance="primary"
+                  icon={createMutation.isPending ? <Spinner size="tiny" /> : undefined}
                   disabled={!title.trim() || !specMd.trim() || createMutation.isPending}
                   onClick={() => createMutation.mutate()}
                 >
-                  Analyze Against Running Project →
+                  {createMutation.isPending ? 'Analyzing Feature…' : 'Analyze Against Running Project →'}
                 </Button>
               </div>
             </>
@@ -144,9 +156,24 @@ export const FeaturesPage: React.FC<{ projectId?: string; repoId?: string }> = (
               <Text>
                 PM agent checked your feature spec against existing requirements, open issues, and public-safe hygiene.
               </Text>
+              <OperationProgressBanner
+                active={planIncrementMutation.isPending}
+                title="Generating backlog plan increment…"
+                subtitle="Microsoft Foundry orchestrator-model (MAI-Thinking-1) is synthesizing incremental issues and touch-set overlap checks."
+                phases={[
+                  'Assigning monotonic REQ-xxx IDs for new capabilities',
+                  'Decomposing acceptance tests and implementation work items',
+                  'Checking touch-set overlap with work currently in flight'
+                ]}
+              />
               <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
-                <Button appearance="primary" onClick={() => planIncrementMutation.mutate()}>
-                  Generate Plan Increment →
+                <Button
+                  appearance="primary"
+                  icon={planIncrementMutation.isPending ? <Spinner size="tiny" /> : undefined}
+                  disabled={planIncrementMutation.isPending}
+                  onClick={() => planIncrementMutation.mutate()}
+                >
+                  {planIncrementMutation.isPending ? 'Generating Plan Increment…' : 'Generate Plan Increment →'}
                 </Button>
               </div>
             </>
@@ -215,13 +242,27 @@ export const FeaturesPage: React.FC<{ projectId?: string; repoId?: string }> = (
                 </div>
               ))}
 
+              <OperationProgressBanner
+                active={approveIncrementMutation.isPending}
+                title="Applying feature increment on GitHub…"
+                subtitle="Opening docs specification PR, creating GitHub issues, and linking board items without restarting work in flight."
+                phases={[
+                  'Opening docs-only specification PR for feature spec & docs/spec.md',
+                  'Creating new GitHub issues with factory labels & dependencies',
+                  'Adding cards to Project v2 board and notifying ProjectScheduler'
+                ]}
+              />
+
               <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
                 <Button
                   appearance="primary"
+                  icon={approveIncrementMutation.isPending ? <Spinner size="tiny" /> : undefined}
                   disabled={approveIncrementMutation.isPending}
                   onClick={() => approveIncrementMutation.mutate()}
                 >
-                  Approve & Apply Increment (Spec PR + Board Items) →
+                  {approveIncrementMutation.isPending
+                    ? 'Applying Increment on GitHub…'
+                    : 'Approve & Apply Increment (Spec PR + Board Items) →'}
                 </Button>
               </div>
             </div>

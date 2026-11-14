@@ -223,8 +223,22 @@ export const api = {
   getProjects: () => request<ProjectSummary[]>('/api/projects'),
   getProject: (id: string) => request<any>(`/api/projects/${id}`),
   createProject: (payload: any) => request<any>('/api/projects', { method: 'POST', body: JSON.stringify(payload) }),
-  clarifyProject: (id: string, answers: Record<string, string>, dismissPublicSafeFlags = false) =>
-    request<any>(`/api/projects/${id}:clarify`, { method: 'POST', body: JSON.stringify({ answers, dismissPublicSafeFlags }) }),
+  clarifyProject: (
+    id: string,
+    answers: Record<string, string>,
+    dismissPublicSafeFlags = false,
+    options?: { templateId?: string; autonomy?: AutonomyLevel; codingModel?: string }
+  ) =>
+    request<any>(`/api/projects/${id}:clarify`, {
+      method: 'POST',
+      body: JSON.stringify({
+        answers,
+        dismissPublicSafeFlags,
+        templateId: options?.templateId,
+        autonomy: options?.autonomy,
+        codingModel: options?.codingModel
+      })
+    }),
   getProjectPlan: (id: string) => request<GeneratedPlan>(`/api/projects/${id}/plan`),
   saveProjectPlan: (id: string, plan: GeneratedPlan) =>
     request<GeneratedPlan>(`/api/projects/${id}/plan`, { method: 'PUT', body: JSON.stringify(plan) }),

@@ -658,8 +658,16 @@ public sealed class FactoryOrchestrationCoordinator(
                 continue;
             }
 
-            await ClaimAndAssignToCopilotActivityAsync(sel.Candidate.WorkItemId, 1, ct);
-            started.Add(sel.Candidate.WorkItemId);
+            try
+            {
+                await ClaimAndAssignToCopilotActivityAsync(sel.Candidate.WorkItemId, 1, ct);
+                started.Add(sel.Candidate.WorkItemId);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                logger.LogWarning(ex, "Copilot assignment failed for work item {WorkItemId}; marking Blocked.", sel.Candidate.WorkItemId);
+                await MarkBlockedActivityAsync(sel.Candidate.WorkItemId, $"Copilot assignment blocked: {ex.Message}", ct);
+            }
         }
 
         return started;
@@ -688,9 +696,43 @@ public sealed class FactoryOrchestrationCoordinator(
         var owner = envOptions.Value.OwnerLogin;
         var repoName = project.Slug;
 
+        steps.AddRange([
+            new BootstrapStepRecord(5, "Create repository from golden-path template", "Pending"),
+            new BootstrapStepRecord(6, "Apply GitHub security baseline (push protection & CodeQL)", "Pending"),
+            new BootstrapStepRecord(7, "Apply default-branch ruleset & Copilot review settings", "Pending"),
+            new BootstrapStepRecord(8, "Create Project v2 board (auto-add off)", "Pending"),
+            new BootstrapStepRecord(9, $"Create {plan.Items.Count} backlog issues & dependencies", "Pending"),
+            new BootstrapStepRecord(10, "Azure OIDC preview/demo wiring & readiness smoke test", "Pending"),
+            new BootstrapStepRecord(11, "Start ProjectScheduler (dispatch walking skeleton)", "Pending")
+        ]);
+
+        async Task UpdateStepAsync(int stepNumber, string status, string? overrideName = null)
+        {
+            var idx = steps.FindIndex(s => s.StepNumber == stepNumber);
+            if (idx >= 0)
+            {
+                steps[idx] = steps[idx] with
+                {
+                    Name = overrideName ?? steps[idx].Name,
+                    Status = status
+                };
+            }
+
+            var json = JsonSerializer.Serialize(steps, JsonOpts);
+            project.BootstrapStepsJson = json;
+
+            await using var progressDb = await dbFactory.CreateDbContextAsync(ct);
+            await progressDb.Projects
+                .Where(p => p.Id == project.Id)
+                .ExecuteUpdateAsync(s => s
+                    .SetProperty(p => p.BootstrapStepsJson, json)
+                    .SetProperty(p => p.UpdatedAt, DateTimeOffset.UtcNow), ct);
+        }
+
         // Step 5: Create repo from golden-path template
+        await UpdateStepAsync(5, "InProgress");
         await gitHub.CreateRepositoryFromTemplateAsync(owner, $"demo-factory-template-{project.TemplateId}", owner, repoName, project.IsPublic, project.SpecMarkdown, plan.Adr0001Markdown, ct);
-        steps.Add(new BootstrapStepRecord(5, "Create repository from golden-path template", "Completed"));
+        await UpdateStepAsync(5, "Completed");
 
         var repo = await db.Repositories.FirstOrDefaultAsync(r => r.ProjectId == project.Id, ct);
         if (repo is null)
@@ -719,18 +761,21 @@ public sealed class FactoryOrchestrationCoordinator(
         await policyRepo.EnsureDefaultPolicyFileAsync(owner, repoName, repo.GitHubProjectNumber, project.DefaultAutonomy, ct);
 
         // Step 6: Apply security baseline
+        await UpdateStepAsync(6, "InProgress");
         await gitHub.ApplySecurityBaselineAsync(owner, repoName, project.IsPublic, ct);
-        steps.Add(new BootstrapStepRecord(6, "Apply GitHub security baseline (push protection & CodeQL)", "Completed"));
+        await UpdateStepAsync(6, "Completed");
 
         // Step 7: Apply rulesets & Copilot settings
+        await UpdateStepAsync(7, "InProgress");
         await gitHub.ApplyRulesetsAndSettingsAsync(owner, repoName, ["build", "test", "lint"], ct);
-        steps.Add(new BootstrapStepRecord(7, "Apply default-branch ruleset & Copilot review settings", "Completed"));
+        await UpdateStepAsync(7, "Completed");
 
         // Step 8: Copy Project v2 board
+        await UpdateStepAsync(8, "InProgress");
         var (projId, projNum) = await gitHub.CopyProjectBoardAsync(owner, repoName, $"{project.Name} Board", ct);
         repo.GitHubProjectId = projId;
         repo.GitHubProjectNumber = projNum;
-        steps.Add(new BootstrapStepRecord(8, "Create Project v2 board (auto-add off)", "Completed"));
+        await UpdateStepAsync(8, "Completed");
 
         // Persist requirements & spec v1
         if (!await db.SpecVersions.AnyAsync(sv => sv.ProjectId == project.Id, ct))
@@ -760,75 +805,84 @@ public sealed class FactoryOrchestrationCoordinator(
             }
         }
 
-        // Step 9: Create backlog issues, blockedBy links, and Project v2 items
-        var createdMap = new Dictionary<string, (CreatedIssueRef Issue, WorkItemEntity Entity)>(StringComparer.OrdinalIgnoreCase);
-        foreach (var item in plan.Items)
+        // Step 9: Create backlog issues, blockedBy links, and Project v2 items (idempotent on retry)
+        if (!await db.WorkItems.AnyAsync(w => w.RepoId == repo.Id, ct))
         {
-            var labels = new List<string> { "factory" };
-            if (item.IsAcceptanceTest)
-                labels.Add("acceptance-test");
-
-            var createdIssue = await gitHub.CreateIssueAsync(owner, repoName, item.Title, item.Description, labels, ct);
-            var boardItemId = await gitHub.AddIssueToProjectBoardAsync(projId, createdIssue.NodeId, item.InitialStatus, item.Priority, item.Size, "Queued", project.DefaultCodingModel, null, ct);
-
-            var wi = new WorkItemEntity
+            await UpdateStepAsync(9, "InProgress", $"Creating backlog issues & dependencies (0 / {plan.Items.Count})...");
+            var createdMap = new Dictionary<string, (CreatedIssueRef Issue, WorkItemEntity Entity)>(StringComparer.OrdinalIgnoreCase);
+            var createdCount = 0;
+            foreach (var item in plan.Items)
             {
-                RepoId = repo.Id,
-                IssueNumber = createdIssue.Number,
-                IssueNodeId = createdIssue.NodeId,
-                ProjectItemId = boardItemId,
-                Title = item.Title,
-                BodyMarkdown = item.Description,
-                AcceptanceCriteriaJson = JsonSerializer.Serialize(item.AcceptanceCriteria, JsonOpts),
-                LabelsJson = JsonSerializer.Serialize(labels, JsonOpts),
-                IssueAuthor = owner,
-                WorkLabelAppliedBy = owner,
-                PassesWorkLabelRule = true,
-                IsAcceptanceTestIssue = item.IsAcceptanceTest,
-                GateProfile = item.IsAcceptanceTest ? GateProfile.AcceptanceTest : GateProfile.Feature,
-                State = WorkItemStateKind.Queued,
-                BoardStatus = item.InitialStatus,
-                Priority = item.Priority,
-                Size = item.Size,
-                CodingModel = project.DefaultCodingModel,
-                PredictedTouchPathsJson = JsonSerializer.Serialize(item.PredictedTouchPaths, JsonOpts),
-                RequirementIdsJson = JsonSerializer.Serialize(item.RequirementIds, JsonOpts),
-                ReadyAt = item.InitialStatus == BoardStatus.Ready ? DateTimeOffset.UtcNow : null
-            };
-            db.WorkItems.Add(wi);
-            createdMap[item.Key] = (createdIssue, wi);
-        }
+                var labels = new List<string> { "factory" };
+                if (item.IsAcceptanceTest)
+                    labels.Add("acceptance-test");
 
-        foreach (var item in plan.Items)
-        {
-            var (depIssue, depEntity) = createdMap[item.Key];
-            var blockerNums = new List<int>(item.BlockedByExistingIssueNumbers);
-            foreach (var bKey in item.BlockedByKeys)
-            {
-                if (createdMap.TryGetValue(bKey, out var blocker))
+                var createdIssue = await gitHub.CreateIssueAsync(owner, repoName, item.Title, item.Description, labels, ct);
+                var boardItemId = await gitHub.AddIssueToProjectBoardAsync(projId, createdIssue.NodeId, item.InitialStatus, item.Priority, item.Size, "Queued", project.DefaultCodingModel, null, ct);
+
+                var wi = new WorkItemEntity
                 {
-                    blockerNums.Add(blocker.Issue.Number);
-                    await gitHub.AddBlockedByDependencyAsync(depIssue.NodeId, blocker.Issue.NodeId, ct);
-                }
+                    RepoId = repo.Id,
+                    IssueNumber = createdIssue.Number,
+                    IssueNodeId = createdIssue.NodeId,
+                    ProjectItemId = boardItemId,
+                    Title = item.Title,
+                    BodyMarkdown = item.Description,
+                    AcceptanceCriteriaJson = JsonSerializer.Serialize(item.AcceptanceCriteria, JsonOpts),
+                    LabelsJson = JsonSerializer.Serialize(labels, JsonOpts),
+                    IssueAuthor = owner,
+                    WorkLabelAppliedBy = owner,
+                    PassesWorkLabelRule = true,
+                    IsAcceptanceTestIssue = item.IsAcceptanceTest,
+                    GateProfile = item.IsAcceptanceTest ? GateProfile.AcceptanceTest : GateProfile.Feature,
+                    State = WorkItemStateKind.Queued,
+                    BoardStatus = item.InitialStatus,
+                    Priority = item.Priority,
+                    Size = item.Size,
+                    CodingModel = project.DefaultCodingModel,
+                    PredictedTouchPathsJson = JsonSerializer.Serialize(item.PredictedTouchPaths, JsonOpts),
+                    RequirementIdsJson = JsonSerializer.Serialize(item.RequirementIds, JsonOpts),
+                    ReadyAt = item.InitialStatus == BoardStatus.Ready ? DateTimeOffset.UtcNow : null
+                };
+                db.WorkItems.Add(wi);
+                createdMap[item.Key] = (createdIssue, wi);
+                createdCount++;
+                await UpdateStepAsync(9, "InProgress", $"Creating backlog issues & dependencies ({createdCount} / {plan.Items.Count})...");
             }
-            depEntity.BlockedByIssueNumbersJson = JsonSerializer.Serialize(blockerNums, JsonOpts);
+
+            foreach (var item in plan.Items)
+            {
+                var (depIssue, depEntity) = createdMap[item.Key];
+                var blockerNums = new List<int>(item.BlockedByExistingIssueNumbers);
+                foreach (var bKey in item.BlockedByKeys)
+                {
+                    if (createdMap.TryGetValue(bKey, out var blocker))
+                    {
+                        blockerNums.Add(blocker.Issue.Number);
+                        await gitHub.AddBlockedByDependencyAsync(depIssue.NodeId, blocker.Issue.NodeId, ct);
+                    }
+                }
+                depEntity.BlockedByIssueNumbersJson = JsonSerializer.Serialize(blockerNums, JsonOpts);
+            }
         }
-        steps.Add(new BootstrapStepRecord(9, $"Created {plan.Items.Count} backlog issues & dependencies", "Completed"));
+        await UpdateStepAsync(9, "Completed", $"Created {plan.Items.Count} backlog issues & dependencies");
 
         // Step 9b & 10: Azure OIDC wiring + readiness smoke test
+        await UpdateStepAsync(10, "InProgress");
         var readiness = await gitHub.EvaluateRepositoryReadinessAsync(owner, repoName, ct);
         repo.ReadinessReportJson = JsonSerializer.Serialize(readiness, JsonOpts);
         project.DemoUrl = $"https://ca-demo-{repoName}.swedencentral.azurecontainerapps.io";
-        steps.Add(new BootstrapStepRecord(10, "Azure OIDC preview/demo wiring & readiness smoke test", "Completed"));
+        await UpdateStepAsync(10, "Completed");
 
         // Step 11: Start ProjectScheduler (walking skeleton goes first)
+        await UpdateStepAsync(11, "InProgress");
         project.State = ProjectState.Running;
         project.BootstrapStepsJson = JsonSerializer.Serialize(steps, JsonOpts);
         project.UpdatedAt = DateTimeOffset.UtcNow;
         await db.SaveChangesAsync(ct);
 
         await SelectAndStartScheduledItemsActivityAsync(repo.Id, ct);
-        steps.Add(new BootstrapStepRecord(11, "Started ProjectScheduler (walking skeleton dispatched)", "Completed"));
+        await UpdateStepAsync(11, "Completed", "Started ProjectScheduler (walking skeleton dispatched)");
 
         project.BootstrapStepsJson = JsonSerializer.Serialize(steps, JsonOpts);
         await db.SaveChangesAsync(ct);

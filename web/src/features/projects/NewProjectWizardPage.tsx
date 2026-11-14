@@ -7,6 +7,7 @@ import {
   Dropdown,
   Input,
   Option,
+  Spinner,
   Textarea,
   Text,
   tokens
@@ -15,7 +16,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useNavigate } from 'react-router-dom';
 import { Background, Edge, MarkerType, Node, ReactFlow } from '@xyflow/react';
 import { GeneratedPlan, PlannedBacklogItem, api } from '../../api/client';
-import { StatusPill } from '../../components/SharedComponents';
+import { OperationProgressBanner, StatusPill } from '../../components/SharedComponents';
 
 export const NewProjectWizardPage: React.FC = () => {
   const navigate = useNavigate();
@@ -65,7 +66,12 @@ export const NewProjectWizardPage: React.FC = () => {
   });
 
   const clarifyAndPlanMutation = useMutation({
-    mutationFn: () => api.clarifyProject(projectId!, answers, dismissFlags),
+    mutationFn: () =>
+      api.clarifyProject(projectId!, answers, dismissFlags, {
+        templateId,
+        autonomy,
+        codingModel
+      }),
     onSuccess: res => {
       setErrorMsg(null);
       setPlan(res.plan);
@@ -90,6 +96,13 @@ export const NewProjectWizardPage: React.FC = () => {
       qc.invalidateQueries({ queryKey: ['board'] });
     },
     onError: (e: Error) => setErrorMsg(e.message)
+  });
+
+  const liveBootstrapQuery = useQuery({
+    queryKey: ['projectBootstrapLive', projectId],
+    queryFn: () => api.getProjectBootstrap(projectId!),
+    enabled: Boolean(projectId && approveAndLaunchMutation.isPending),
+    refetchInterval: 1500
   });
 
   const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -212,13 +225,27 @@ export const NewProjectWizardPage: React.FC = () => {
               {specMarkdown}
             </div>
           </div>
+          <OperationProgressBanner
+            active={intakeMutation.isPending}
+            title="Analyzing specification & running public-repo hygiene scan…"
+            subtitle="Microsoft Foundry orchestrator-model (MAI-Thinking-1) is reasoning over your Markdown specification."
+            phases={[
+              'Parsing specification headings, goals, and constraints',
+              'Scanning for secrets, internal URLs, and personal data',
+              'Extracting traceable REQ-xxx requirements',
+              'Formulating clarifying questions for open ambiguities'
+            ]}
+          />
           <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
             <Button
               appearance="primary"
+              icon={intakeMutation.isPending ? <Spinner size="tiny" /> : undefined}
               disabled={!name.trim() || !specMarkdown.trim() || intakeMutation.isPending}
               onClick={() => intakeMutation.mutate()}
             >
-              Analyze Spec & Run Public-Safe Check →
+              {intakeMutation.isPending
+                ? 'Analyzing Specification…'
+                : 'Analyze Spec & Run Public-Safe Check →'}
             </Button>
           </div>
         </Card>
@@ -334,16 +361,35 @@ export const NewProjectWizardPage: React.FC = () => {
             Deployment target: Azure Container Apps per-PR previews + live demo environment via OIDC.
           </Text>
 
+          <OperationProgressBanner
+            active={clarifyAndPlanMutation.isPending}
+            title="Generating architecture decision (ADR-0001) & dependency-ordered backlog…"
+            subtitle="Microsoft Foundry orchestrator-model (MAI-Thinking-1) is decomposing your specification into vertical slices and locked acceptance tests."
+            phases={[
+              'Synthesizing ADR-0001 architecture, synthetic seed strategy, and stack conventions',
+              'Mapping clarified scope to testable REQ-xxx requirements',
+              'Creating walking skeleton, acceptance-test issues, and implementation slices',
+              'Validating acyclic dependency graph and estimating delivery effort'
+            ]}
+          />
+
           <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-            <Button appearance="secondary" onClick={() => setStep(2)}>
+            <Button
+              appearance="secondary"
+              disabled={clarifyAndPlanMutation.isPending}
+              onClick={() => setStep(2)}
+            >
               ← Back
             </Button>
             <Button
               appearance="primary"
+              icon={clarifyAndPlanMutation.isPending ? <Spinner size="tiny" /> : undefined}
               disabled={clarifyAndPlanMutation.isPending}
               onClick={() => clarifyAndPlanMutation.mutate()}
             >
-              Generate Architecture & Backlog Plan →
+              {clarifyAndPlanMutation.isPending
+                ? 'Generating Architecture & Backlog Plan…'
+                : 'Generate Architecture & Backlog Plan →'}
             </Button>
           </div>
         </Card>
@@ -361,18 +407,39 @@ export const NewProjectWizardPage: React.FC = () => {
               </Text>
             </div>
             <div style={{ display: 'flex', gap: 8 }}>
-              <Button appearance="secondary" onClick={() => savePlanMutation.mutate(plan)}>
-                Save Edits
+              <Button
+                appearance="secondary"
+                icon={savePlanMutation.isPending ? <Spinner size="tiny" /> : undefined}
+                disabled={savePlanMutation.isPending || approveAndLaunchMutation.isPending}
+                onClick={() => savePlanMutation.mutate(plan)}
+              >
+                {savePlanMutation.isPending ? 'Saving…' : 'Save Edits'}
               </Button>
               <Button
                 appearance="primary"
+                icon={approveAndLaunchMutation.isPending ? <Spinner size="tiny" /> : undefined}
                 disabled={approveAndLaunchMutation.isPending || plan.items.length === 0}
                 onClick={() => approveAndLaunchMutation.mutate()}
               >
-                Approve Plan & Bootstrap Repository →
+                {approveAndLaunchMutation.isPending
+                  ? 'Bootstrapping GitHub Repository…'
+                  : 'Approve Plan & Bootstrap Repository →'}
               </Button>
             </div>
           </div>
+
+          <OperationProgressBanner
+            active={approveAndLaunchMutation.isPending}
+            title="Provisioning GitHub repository, governance rulesets, board & backlog issues…"
+            subtitle="Writing to GitHub with rate-limit pacing (~1 write/sec). Live progress updates automatically below."
+            liveSteps={liveBootstrapQuery.data?.steps}
+            phases={[
+              'Creating GitHub repository and committing golden-path scaffold + docs/spec.md',
+              'Applying GitHub security baseline, branch rulesets, and preview/demo environments',
+              'Creating Project v2 board, backlog issues, and dependency links',
+              'Starting ProjectScheduler and assigning walking skeleton to Copilot'
+            ]}
+          />
 
           <div style={{ display: 'grid', gridTemplateColumns: '1.4fr 1fr', gap: 14 }}>
             <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>

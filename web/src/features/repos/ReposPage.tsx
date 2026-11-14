@@ -6,13 +6,14 @@ import {
   Dropdown,
   Input,
   Option,
+  Spinner,
   Text,
   tokens
 } from '@fluentui/react-components';
 import { CheckmarkCircle20Filled, DismissCircle20Filled } from '@fluentui/react-icons';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { api } from '../../api/client';
-import { PageSkeleton } from '../../components/SharedComponents';
+import { OperationProgressBanner, PageSkeleton } from '../../components/SharedComponents';
 
 export const ReposPage: React.FC<{ selectedRepoId?: string }> = ({ selectedRepoId }) => {
   const qc = useQueryClient();
@@ -60,6 +61,16 @@ export const ReposPage: React.FC<{ selectedRepoId?: string }> = ({ selectedRepoI
         </Card>
       )}
 
+      <OperationProgressBanner
+        active={onboardMutation.isPending || fixMutation.isPending}
+        title={
+          onboardMutation.isPending
+            ? `Inspecting ${owner}/${repoName} on GitHub & onboarding repository…`
+            : 'Applying governance rulesets & opening onboarding profile PR on GitHub…'
+        }
+        subtitle="Evaluating branch protection rulesets, workflow token permissions, environments, and Copilot agent readiness."
+      />
+
       <div style={{ display: 'grid', gridTemplateColumns: '1.3fr 1fr', gap: 16 }}>
         <Card style={{ padding: 16, display: 'flex', flexDirection: 'column', gap: 10 }}>
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
@@ -67,8 +78,14 @@ export const ReposPage: React.FC<{ selectedRepoId?: string }> = ({ selectedRepoI
               Target Repository Readiness Checklist — {readinessQuery.data?.repoFullName ?? 'None'}
             </Text>
             {selectedRepoId && (
-              <Button size="small" appearance="primary" onClick={() => fixMutation.mutate()}>
-                Apply Rulesets & Open Profile PR
+              <Button
+                size="small"
+                appearance="primary"
+                icon={fixMutation.isPending ? <Spinner size="tiny" /> : undefined}
+                disabled={fixMutation.isPending}
+                onClick={() => fixMutation.mutate()}
+              >
+                {fixMutation.isPending ? 'Applying Rulesets…' : 'Apply Rulesets & Open Profile PR'}
               </Button>
             )}
           </div>
@@ -124,10 +141,11 @@ export const ReposPage: React.FC<{ selectedRepoId?: string }> = ({ selectedRepoI
           </Dropdown>
           <Button
             appearance="primary"
+            icon={onboardMutation.isPending ? <Spinner size="tiny" /> : undefined}
             disabled={!owner.trim() || !repoName.trim() || onboardMutation.isPending}
             onClick={() => onboardMutation.mutate()}
           >
-            Run Readiness Check & Onboard
+            {onboardMutation.isPending ? 'Running Readiness Check…' : 'Run Readiness Check & Onboard'}
           </Button>
         </Card>
       </div>

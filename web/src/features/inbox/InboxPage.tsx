@@ -4,6 +4,7 @@ import {
   Button,
   Card,
   Checkbox,
+  Spinner,
   Text,
   tokens
 } from '@fluentui/react-components';
@@ -11,7 +12,7 @@ import { Warning20Filled } from '@fluentui/react-icons';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useNavigate } from 'react-router-dom';
 import { api } from '../../api/client';
-import { EmptyState, PageSkeleton, StatusPill } from '../../components/SharedComponents';
+import { EmptyState, OperationProgressBanner, PageSkeleton, StatusPill } from '../../components/SharedComponents';
 
 export const InboxPage: React.FC<{ projectId?: string }> = ({ projectId }) => {
   const navigate = useNavigate();
@@ -70,12 +71,26 @@ export const InboxPage: React.FC<{ projectId?: string }> = ({ projectId }) => {
         </div>
         <Button
           appearance="primary"
+          icon={createFeatureMutation.isPending ? <Spinner size="tiny" /> : undefined}
           disabled={selectedNumbers.length === 0 || createFeatureMutation.isPending}
           onClick={() => createFeatureMutation.mutate()}
         >
-          Create Feature from Selected ({selectedNumbers.length})
+          {createFeatureMutation.isPending
+            ? `Synthesizing Feature (${selectedNumbers.length})…`
+            : `Create Feature from Selected (${selectedNumbers.length})`}
         </Button>
       </div>
+
+      <OperationProgressBanner
+        active={createFeatureMutation.isPending}
+        title="Synthesizing vetted feature specification & backlog increment from selected issues…"
+        subtitle="Microsoft Foundry orchestrator-model (MAI-Thinking-1) is drafting the feature spec, generating plan items, and opening the specification PR."
+        phases={[
+          'Drafting sanitized feature specification from untrusted inbox issues',
+          'Generating incremental requirements & backlog work items',
+          'Opening specification PR and adding issues to the board'
+        ]}
+      />
 
       {anyOwnerTriedDirectLabel && (
         <Card

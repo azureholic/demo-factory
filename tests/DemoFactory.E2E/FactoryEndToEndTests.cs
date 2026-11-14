@@ -433,6 +433,9 @@ public sealed class FactoryEndToEndTests : IAsyncLifetime
                             if (req.Method == HttpMethod.Get && req.RequestUri.AbsolutePath.Contains("/contents/", StringComparison.Ordinal))
                                 return StubJson(HttpStatusCode.NotFound, new { message = "Not Found" });
 
+                            if (req.Method == HttpMethod.Put && req.RequestUri.AbsolutePath.Contains("/contents/.github/workflows/", StringComparison.OrdinalIgnoreCase))
+                                return StubJson(HttpStatusCode.Forbidden, new { message = "Resource not accessible by integration" });
+
                             if (req.Method == HttpMethod.Put && req.RequestUri.AbsolutePath.Contains("/contents/", StringComparison.Ordinal))
                                 return StubJson(HttpStatusCode.Created, new { content = new { sha = "file_sha_1" } });
 

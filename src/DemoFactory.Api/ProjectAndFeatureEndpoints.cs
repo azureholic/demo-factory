@@ -21,7 +21,12 @@ public sealed record CreateProjectRequest(
     string DeployTarget = "aca-previews-and-demo",
     bool IsPublic = true);
 
-public sealed record ClarifyAnswersRequest(IReadOnlyDictionary<string, string>? Answers, bool DismissPublicSafeFlags = false);
+public sealed record ClarifyAnswersRequest(
+    IReadOnlyDictionary<string, string>? Answers,
+    bool DismissPublicSafeFlags = false,
+    string? TemplateId = null,
+    AutonomyLevel? Autonomy = null,
+    string? CodingModel = null);
 
 public sealed record CreateFeatureRequest(
     string Title,
@@ -175,6 +180,13 @@ public static class ProjectAndFeatureEndpoints
             if (string.Equals(action, "clarify", StringComparison.OrdinalIgnoreCase))
             {
                 var body = await ReadJsonOrDefaultAsync<ClarifyAnswersRequest>(http.Request, ct) ?? new ClarifyAnswersRequest(null);
+                if (!string.IsNullOrWhiteSpace(body.TemplateId))
+                    project.TemplateId = body.TemplateId.Trim();
+                if (body.Autonomy.HasValue)
+                    project.DefaultAutonomy = body.Autonomy.Value;
+                if (!string.IsNullOrWhiteSpace(body.CodingModel))
+                    project.DefaultCodingModel = body.CodingModel.Trim();
+
                 if (body.Answers is { Count: > 0 })
                 {
                     var notes = string.Join("\n", body.Answers.Select(kv => $"- **{kv.Key}**: {kv.Value}"));
@@ -227,8 +239,15 @@ public static class ProjectAndFeatureEndpoints
                 await db.SaveChangesAsync(ct);
 
                 await auditLogger.RecordAsync(actor, "ProjectPlanApproved", "Project", project.Id.ToString(), ct: ct);
-                var steps = await coordinator.RunProjectBootstrapAsync(project.Id, actor, ct);
-                return Results.Ok(new { projectId = project.Id, state = ProjectState.Running, bootstrapSteps = steps });
+                try
+                {
+                    var steps = await coordinator.RunProjectBootstrapAsync(project.Id, actor, ct);
+                    return Results.Ok(new { projectId = project.Id, state = ProjectState.Running, bootstrapSteps = steps });
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException)
+                {
+                    return Results.Json(new { error = $"Repository bootstrap failed: {ex.Message}" }, statusCode: StatusCodes.Status502BadGateway);
+                }
             }
 
             return Results.NotFound();

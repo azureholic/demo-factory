@@ -231,6 +231,11 @@ public sealed class GitHubGateway(
             else
             {
                 existingTarget.Dispose();
+                using var existingSpec = await TryGetJsonAsync(http, $"/repos/{newOwner}/{newRepo}/contents/docs/spec.md", ct);
+                if (existingSpec is null)
+                {
+                    await SeedGoldenPathTemplateFilesAsync(http, newOwner, newRepo, templateRepo, ct);
+                }
             }
 
             await UpsertRepoFileHttpAsync(http, newOwner, newRepo, "docs/spec.md", specMarkdown, "docs: initialize living specification", ct);
@@ -858,7 +863,16 @@ public sealed class GitHubGateway(
 
         foreach (var (path, content) in filesToCommit)
         {
-            await UpsertRepoFileHttpAsync(http, owner, repo, path, content, $"docs: {title}", ct, branchName);
+            try
+            {
+                await UpsertRepoFileHttpAsync(http, owner, repo, path, content, $"docs: {title}", ct, branchName);
+            }
+            catch (HttpRequestException ex) when (
+                path.StartsWith(".github/workflows/", StringComparison.OrdinalIgnoreCase) &&
+                ex.StatusCode is System.Net.HttpStatusCode.Forbidden or System.Net.HttpStatusCode.NotFound)
+            {
+                logger.LogWarning("Skipping workflow file {Path} on {Owner}/{Repo}: GitHub App does not have 'Workflows: Read and write' permission.", path, owner, repo);
+            }
         }
 
         using var prDoc = await SendGitHubRestForJsonAsync(http, HttpMethod.Post, $"/repos/{owner}/{repo}/pulls", new
@@ -1290,11 +1304,24 @@ public sealed class GitHubGateway(
         if (!Directory.Exists(templateDir))
             return;
 
-        foreach (var filePath in Directory.EnumerateFiles(templateDir, "*", SearchOption.AllDirectories))
+        var orderedFiles = Directory.EnumerateFiles(templateDir, "*", SearchOption.AllDirectories)
+            .OrderBy(f => Path.GetRelativePath(templateDir, f).Replace('\\', '/').StartsWith(".github/workflows/", StringComparison.OrdinalIgnoreCase) ? 1 : 0)
+            .ToList();
+
+        foreach (var filePath in orderedFiles)
         {
             var relPath = Path.GetRelativePath(templateDir, filePath).Replace('\\', '/');
             var content = await File.ReadAllTextAsync(filePath, ct);
-            await UpsertRepoFileHttpAsync(http, owner, repo, relPath, content, $"chore: scaffold golden-path {relPath}", ct);
+            try
+            {
+                await UpsertRepoFileHttpAsync(http, owner, repo, relPath, content, $"chore: scaffold golden-path {relPath}", ct);
+            }
+            catch (HttpRequestException ex) when (
+                relPath.StartsWith(".github/workflows/", StringComparison.OrdinalIgnoreCase) &&
+                ex.StatusCode is System.Net.HttpStatusCode.Forbidden or System.Net.HttpStatusCode.NotFound)
+            {
+                logger.LogWarning("Skipping workflow template {Path} on {Owner}/{Repo}: GitHub App lacks 'Workflows: Read and write' permission.", relPath, owner, repo);
+            }
         }
     }
 

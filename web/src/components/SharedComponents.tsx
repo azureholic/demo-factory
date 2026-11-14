@@ -1,10 +1,12 @@
-import React from 'react';
+import React, { useEffect, useState } from 'react';
 import {
   Badge,
   Button,
   Card,
+  ProgressBar,
   Skeleton,
   SkeletonItem,
+  Spinner,
   Text,
   tokens
 } from '@fluentui/react-components';
@@ -20,7 +22,7 @@ import { useMutation, useQueryClient } from '@tanstack/react-query';
 
 export const StatusPill: React.FC<{ status: string }> = ({ status }) => {
   const color =
-    status === 'Running' || status === 'Merged' || status === 'Done' || status === 'Pass' || status === 'Applied'
+    status === 'Running' || status === 'Merged' || status === 'Done' || status === 'Pass' || status === 'Applied' || status === 'Completed'
       ? 'success'
       : status === 'Blocked' || status === 'Failed' || status === 'LineStopped' || status === 'Paused'
       ? 'danger'
@@ -34,6 +36,147 @@ export const StatusPill: React.FC<{ status: string }> = ({ status }) => {
     <Badge appearance="tint" color={color} shape="rounded">
       {status}
     </Badge>
+  );
+};
+
+export const OperationProgressBanner: React.FC<{
+  active: boolean;
+  title: string;
+  subtitle?: string;
+  phases?: string[];
+  liveSteps?: { stepNumber: number; name: string; status: string }[];
+}> = ({ active, title, subtitle, phases, liveSteps }) => {
+  const [elapsedSec, setElapsedSec] = useState(0);
+
+  useEffect(() => {
+    if (!active) {
+      setElapsedSec(0);
+      return;
+    }
+    const started = Date.now();
+    const timer = window.setInterval(() => {
+      setElapsedSec(Math.floor((Date.now() - started) / 1000));
+    }, 500);
+    return () => window.clearInterval(timer);
+  }, [active]);
+
+  if (!active) return null;
+
+  const mins = Math.floor(elapsedSec / 60);
+  const secs = String(elapsedSec % 60).padStart(2, '0');
+  const activePhaseIndex =
+    phases && phases.length > 0 ? Math.min(Math.floor(elapsedSec / 6), phases.length - 1) : -1;
+
+  const completedLiveCount = liveSteps?.filter(s => s.status === 'Completed').length ?? 0;
+  const totalLiveCount = liveSteps?.length ?? 0;
+
+  return (
+    <Card
+      role="status"
+      aria-live="polite"
+      style={{
+        padding: '14px 18px',
+        border: `2px solid ${tokens.colorBrandStroke1}`,
+        background: tokens.colorNeutralBackground2,
+        display: 'flex',
+        flexDirection: 'column',
+        gap: 10
+      }}
+    >
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+          <Spinner size="small" />
+          <div>
+            <Text weight="bold" size={400} block>
+              {title}
+            </Text>
+            {subtitle && (
+              <Text size={200} style={{ color: tokens.colorNeutralForeground3 }}>
+                {subtitle}
+              </Text>
+            )}
+          </div>
+        </div>
+        <Badge appearance="filled" color="brand">
+          {mins}:{secs} elapsed
+        </Badge>
+      </div>
+
+      <ProgressBar
+        thickness="large"
+        value={totalLiveCount > 0 ? completedLiveCount / totalLiveCount : undefined}
+      />
+
+      {liveSteps && liveSteps.length > 0 ? (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginTop: 2 }}>
+          {liveSteps.map(s => {
+            const isDone = s.status === 'Completed';
+            const isRunning = s.status === 'InProgress';
+            return (
+              <div
+                key={s.stepNumber}
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'space-between',
+                  padding: '6px 10px',
+                  borderRadius: 6,
+                  background: isRunning ? tokens.colorNeutralBackground1 : 'transparent',
+                  border: isRunning ? `1px solid ${tokens.colorBrandStroke1}` : '1px solid transparent',
+                  opacity: !isDone && !isRunning ? 0.6 : 1
+                }}
+              >
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                  {isDone ? (
+                    <CheckmarkCircle20Filled style={{ color: tokens.colorPaletteGreenForeground1 }} />
+                  ) : isRunning ? (
+                    <Spinner size="extra-tiny" />
+                  ) : (
+                    <Clock20Regular style={{ color: tokens.colorNeutralForeground3 }} />
+                  )}
+                  <Text size={200} weight={isRunning ? 'semibold' : 'regular'}>
+                    Step {s.stepNumber}: {s.name}
+                  </Text>
+                </div>
+                <StatusPill status={s.status} />
+              </div>
+            );
+          })}
+        </div>
+      ) : (
+        phases &&
+        phases.length > 0 && (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 4, marginTop: 2 }}>
+            {phases.map((phase, idx) => {
+              const isDone = idx < activePhaseIndex;
+              const isCurrent = idx === activePhaseIndex;
+              return (
+                <div
+                  key={idx}
+                  style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: 8,
+                    opacity: idx > activePhaseIndex ? 0.5 : 1
+                  }}
+                >
+                  {isDone ? (
+                    <CheckmarkCircle20Filled style={{ color: tokens.colorPaletteGreenForeground1 }} />
+                  ) : isCurrent ? (
+                    <Spinner size="extra-tiny" />
+                  ) : (
+                    <Clock20Regular style={{ color: tokens.colorNeutralForeground3 }} />
+                  )}
+                  <Text size={200} weight={isCurrent ? 'semibold' : 'regular'}>
+                    {phase}
+                  </Text>
+                </div>
+              );
+            })}
+          </div>
+        )
+      )}
+    </Card>
   );
 };
 

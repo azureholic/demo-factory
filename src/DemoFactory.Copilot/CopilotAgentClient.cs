@@ -100,7 +100,30 @@ public sealed class CopilotAgentClient(
                 },
                 ct);
 
-            if (!resp.IsSuccessStatusCode)
+            if (resp.StatusCode == System.Net.HttpStatusCode.UnprocessableEntity)
+            {
+                // Retry without explicit model alias if the selected model ID is not recognized by GitHub's public API
+                using var fallbackResp = await http.PostAsJsonAsync(
+                    $"https://api.github.com/repos/{request.Owner}/{request.Repo}/issues/{request.IssueNumber}/assignees",
+                    new
+                    {
+                        assignees = new[] { "copilot-swe-agent[bot]" },
+                        agent_assignment = new
+                        {
+                            target_repo = $"{request.Owner}/{request.Repo}",
+                            base_branch = request.BaseBranch,
+                            custom_instructions = request.CustomInstructions
+                        }
+                    },
+                    ct);
+
+                if (!fallbackResp.IsSuccessStatusCode)
+                {
+                    var fallbackDetail = await fallbackResp.Content.ReadAsStringAsync(ct);
+                    throw new InvalidOperationException($"GitHub Copilot cloud agent assignment failed with HTTP {(int)fallbackResp.StatusCode} on {request.Owner}/{request.Repo}#{request.IssueNumber}: {fallbackDetail}");
+                }
+            }
+            else if (!resp.IsSuccessStatusCode)
             {
                 var detail = await resp.Content.ReadAsStringAsync(ct);
                 throw new InvalidOperationException($"GitHub Copilot cloud agent assignment failed with HTTP {(int)resp.StatusCode} on {request.Owner}/{request.Repo}#{request.IssueNumber}: {detail}");
