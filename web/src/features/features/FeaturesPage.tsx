@@ -84,7 +84,7 @@ export const FeaturesPage: React.FC<{ projectId?: string; repoId?: string }> = (
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
         <div>
           <Text size={600} weight="bold" block>
-            Feature Specifications & Increments (§5.5)
+            Feature Specifications &amp; Increments
           </Text>
           <Text size={200} style={{ color: tokens.colorNeutralForeground3 }}>
             Add scope to a running project without repeating repository bootstrap or disturbing work in flight.
@@ -155,7 +155,7 @@ export const FeaturesPage: React.FC<{ projectId?: string; repoId?: string }> = (
           {wizardStep === 3 && increment && (
             <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
               <Text weight="semibold">
-                Increment Review — New items highlighted; existing backlog dimmed (§14.2 Screen 0a)
+                Increment Review — New items highlighted; existing backlog dimmed
               </Text>
               {increment.overlapWarnings?.length > 0 && (
                 <div style={{ padding: 10, borderRadius: 6, background: tokens.colorPaletteYellowBackground1 }}>

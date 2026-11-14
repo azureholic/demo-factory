@@ -18,11 +18,9 @@ const queryClient = new QueryClient({
 ReactDOM.createRoot(document.getElementById('root')!).render(
   <React.StrictMode>
     <QueryClientProvider client={queryClient}>
-      <SignalRProvider>
-        <BrowserRouter>
-          <AppShell />
-        </BrowserRouter>
-      </SignalRProvider>
+      <BrowserRouter>
+        <AppShell />
+      </BrowserRouter>
     </QueryClientProvider>
   </React.StrictMode>
 );

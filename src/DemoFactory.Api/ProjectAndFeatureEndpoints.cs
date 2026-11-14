@@ -330,7 +330,7 @@ public static class ProjectAndFeatureEndpoints
 
             var repo = await db.Repositories.FirstOrDefaultAsync(r => r.ProjectId == id, ct);
             if (repo is { Paused: true })
-                return Results.BadRequest(new { error = "Project repository is currently paused (§5.5)." });
+                return Results.BadRequest(new { error = "Project repository is currently paused." });
 
             var analysis = await pmAgent.AnalyzeSpecForIntakeAsync(req.SpecMarkdown, ct: ct);
             var slug = ProjectManagerAgent.Slugify(req.Title);
@@ -634,7 +634,7 @@ public static class ProjectAndFeatureEndpoints
             {
                 return Results.UnprocessableEntity(new
                 {
-                    error = "Public-safe check flagged sensitive content in spec edit (§6.3).",
+                    error = "Public-safe check flagged sensitive content in spec edit.",
                     publicSafe
                 });
             }

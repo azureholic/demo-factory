@@ -44,7 +44,7 @@ export const SessionsPage: React.FC<{ repoId?: string }> = ({ repoId }) => {
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 12 }}>
         <div>
           <Text size={600} weight="bold" block>
-            Copilot Cloud Agent Sessions (§9.2, §14.2 Screen 5)
+            Copilot Cloud Agent Sessions
           </Text>
           <Text size={200} style={{ color: tokens.colorNeutralForeground3 }}>
             Every delegated Copilot session with mode, resolved model, token usage, commits, and GitHub session log link

@@ -8,6 +8,7 @@ obj/
 *.db-wal
 node_modules/
 web/dist/
+*.tsbuildinfo
 src/DemoFactory.Api/wwwroot/
 artifacts/
 TestResults/

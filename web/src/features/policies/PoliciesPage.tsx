@@ -74,7 +74,7 @@ export const PoliciesPage: React.FC<{ repoId?: string }> = ({ repoId }) => {
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
       <Text size={600} weight="bold">
-        Policies, Models & Delegated GitHub Identity (§9.4, §12, §14.2 Screen 7)
+        Policies, Models &amp; Delegated GitHub Identity
       </Text>
 
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
@@ -168,7 +168,7 @@ export const PoliciesPage: React.FC<{ repoId?: string }> = ({ repoId }) => {
         {/* GitHub Connection & TokenBroker Status */}
         <Card style={{ padding: 16, display: 'flex', flexDirection: 'column', gap: 12 }}>
           <Text size={400} weight="semibold">
-            GitHub Connection & TokenBroker (§10.1)
+            GitHub Connection &amp; TokenBroker
           </Text>
           <Text size={200}>
             Signed-in Account: <strong>@{me?.login}</strong> ({me?.role}) · Plan: <strong>{me?.copilotPlan}</strong>

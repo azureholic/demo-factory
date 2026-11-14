@@ -6,6 +6,8 @@ export type ItemSize = 'Small' | 'Medium' | 'Large' | 'XLarge';
 export interface CurrentUser {
   login: string;
   role: 'Viewer' | 'Operator' | 'Admin';
+  avatarUrl?: string;
+  authMode?: 'GitHub' | 'Sandbox';
   themePreference: 'system' | 'light' | 'dark';
   densityPreference: 'comfortable' | 'compact';
   copilotPlan: string;
@@ -17,6 +19,15 @@ export interface CurrentUser {
     refreshTokenExpiresAt?: string;
     reconnectRequired: boolean;
   };
+}
+
+export interface AuthConfigDto {
+  gitHubConfigured: boolean;
+  clientId: string;
+  appSlug: string;
+  sandboxAvailable: boolean;
+  defaultOwnerLogin: string;
+  callbackUrl: string;
 }
 
 export interface FactoryStatusDto {
@@ -144,7 +155,24 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export const api = {
-  getMe: () => request<CurrentUser>('/auth/me'),
+  getAuthConfig: () => request<AuthConfigDto>('/auth/config'),
+  saveGitHubOAuthConfig: (payload: { clientId: string; clientSecret: string; appSlug?: string }) =>
+    request<{ gitHubConfigured: boolean; clientId: string; appSlug: string }>('/auth/config/github', {
+      method: 'POST',
+      body: JSON.stringify(payload)
+    }),
+  sandboxLogin: (login: string, role: 'Admin' | 'Operator' | 'Viewer') =>
+    request<{ signedIn: boolean; login: string; role: string; authMode: string }>('/auth/sandbox/login', {
+      method: 'POST',
+      body: JSON.stringify({ login, role })
+    }),
+  logout: () => request<{ signedOut: boolean }>('/auth/logout', { method: 'POST' }),
+  getMe: async (): Promise<CurrentUser | null> => {
+    const resp = await fetch('/auth/me', { credentials: 'include' });
+    if (resp.status === 401 || resp.status === 403) return null;
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    return resp.json() as Promise<CurrentUser>;
+  },
   savePreferences: (prefs: { themePreference?: string; densityPreference?: string }) =>
     request('/auth/preferences', { method: 'PUT', body: JSON.stringify(prefs) }),
   revokeGitHub: () => request('/auth/revoke', { method: 'POST' }),

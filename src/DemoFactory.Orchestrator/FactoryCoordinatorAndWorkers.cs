@@ -59,7 +59,7 @@ public sealed class FactoryOrchestrationCoordinator(
 {
     private static readonly JsonSerializerOptions JsonOpts = new(JsonSerializerDefaults.Web);
     private readonly ConcurrentDictionary<string, bool> _completedIdempotencyKeys = new(StringComparer.OrdinalIgnoreCase);
-    private readonly ConcurrentDictionary<string, byte> _processedDeliveries = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, Task> _deliveryTasks = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<Guid, SemaphoreSlim> _projectFeatureApplyLocks = new();
     private readonly ConcurrentDictionary<Guid, SemaphoreSlim> _repoMergeSerializationLocks = new();
 
@@ -853,7 +853,7 @@ public sealed class FactoryOrchestrationCoordinator(
             var repo = await db.Repositories.FirstAsync(r => r.ProjectId == project.Id, ct);
 
             if (repo.Paused)
-                throw new InvalidOperationException("Cannot apply feature while repository is paused (§5.5).");
+                throw new InvalidOperationException("Cannot apply feature while repository is paused.");
 
             feature.State = FeatureSpecState.Applying;
             await db.SaveChangesAsync(ct);
@@ -1202,11 +1202,11 @@ public sealed class FactoryOrchestrationCoordinator(
         await SelectAndStartScheduledItemsActivityAsync(repoId, ct);
     }
 
-    public async Task ProcessWebhookEnvelopeAsync(WebhookEnvelope envelope, CancellationToken ct = default)
-    {
-        if (!_processedDeliveries.TryAdd(envelope.DeliveryId, 1))
-            return;
+    public Task ProcessWebhookEnvelopeAsync(WebhookEnvelope envelope, CancellationToken ct = default) =>
+        _deliveryTasks.GetOrAdd(envelope.DeliveryId, _ => ProcessWebhookEnvelopeCoreAsync(envelope, ct));
 
+    private async Task ProcessWebhookEnvelopeCoreAsync(WebhookEnvelope envelope, CancellationToken ct)
+    {
         using var doc = JsonDocument.Parse(envelope.PayloadJson);
         var root = doc.RootElement;
 
@@ -1364,7 +1364,7 @@ public sealed class FactoryOrchestrationCoordinator(
                     existingWi.State = WorkItemStateKind.Cancelled;
                     existingWi.BoardStatus = BoardStatus.Backlog;
                     existingWi.PassesWorkLabelRule = false;
-                    existingWi.BlockedReason = "Work label removed (§5.6).";
+                    existingWi.BlockedReason = "Work label removed.";
                     existingWi.UpdatedAt = DateTimeOffset.UtcNow;
                     await db.SaveChangesAsync(ct);
                     await notifier.BroadcastWorkItemChangedAsync(existingWi.Id, repo.Id, existingWi.State.ToString(), ct);

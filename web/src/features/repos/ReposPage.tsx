@@ -51,7 +51,7 @@ export const ReposPage: React.FC<{ selectedRepoId?: string }> = ({ selectedRepoI
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
       <Text size={600} weight="bold">
-        Repositories & Onboarding Wizard (§10.2, §14.2 Screen 6)
+        Repositories &amp; Onboarding Wizard
       </Text>
 
       {fixBanner && (

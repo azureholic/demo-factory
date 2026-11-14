@@ -11,6 +11,12 @@ import {
   Dropdown,
   FluentProvider,
   Input,
+  Menu,
+  MenuDivider,
+  MenuItem,
+  MenuList,
+  MenuPopover,
+  MenuTrigger,
   Option,
   Text,
   tokens
@@ -31,15 +37,17 @@ import {
   Search20Regular,
   Settings20Regular,
   ShieldCheckmark20Regular,
+  SignOut20Regular,
   Sparkle20Regular,
   WeatherMoon20Regular,
   WeatherSunny20Regular
 } from '@fluentui/react-icons';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Route, Routes, useLocation, useNavigate } from 'react-router-dom';
-import { api } from '../api/client';
-import { AndonBanner, StatusPill } from '../components/SharedComponents';
+import { CurrentUser, api } from '../api/client';
+import { AndonBanner, PageSkeleton, StatusPill } from '../components/SharedComponents';
 import { AuditPage } from '../features/audit/AuditPage';
+import { LoginPage } from '../features/auth/LoginPage';
 import { BoardPage } from '../features/board/BoardPage';
 import { FeaturesPage } from '../features/features/FeaturesPage';
 import { GraphPage } from '../features/graph/GraphPage';
@@ -53,7 +61,7 @@ import { SessionsPage } from '../features/sessions/SessionsPage';
 import { SettingsPage } from '../features/settings/SettingsPage';
 import { SpecPage } from '../features/spec/SpecPage';
 import { WorkItemDetailPage } from '../features/workitem/WorkItemDetailPage';
-import { useRealtime } from '../realtime/SignalRProvider';
+import { SignalRProvider, useRealtime } from '../realtime/SignalRProvider';
 import { DensityMode, ThemeMode, useResolvedFluentTheme } from '../theme/factoryTheme';
 
 interface NavEntry {
@@ -79,21 +87,12 @@ const NAV_ITEMS: NavEntry[] = [
 ];
 
 export const AppShell: React.FC = () => {
-  const navigate = useNavigate();
-  const location = useLocation();
-  const qc = useQueryClient();
-  const { connected } = useRealtime();
-
   const [themeMode, setThemeMode] = useState<ThemeMode>(() =>
     (localStorage.getItem('df_theme') as ThemeMode) || 'system'
   );
   const [density, setDensity] = useState<DensityMode>(() =>
     (localStorage.getItem('df_density') as DensityMode) || 'comfortable'
   );
-  const [navCollapsed, setNavCollapsed] = useState(false);
-  const [searchOpen, setSearchOpen] = useState(false);
-  const [searchQuery, setSearchQuery] = useState('');
-  const [selectedRepoId, setSelectedRepoId] = useState<string>('');
 
   const { theme, isDark } = useResolvedFluentTheme(themeMode);
 
@@ -101,7 +100,83 @@ export const AppShell: React.FC = () => {
     document.documentElement.setAttribute('data-density', density);
   }, [density]);
 
-  // Ctrl+K Global Search shortcut (§14.1)
+  const meQuery = useQuery({
+    queryKey: ['me'],
+    queryFn: api.getMe,
+    retry: false
+  });
+
+  const handleThemeChange = (mode: ThemeMode) => {
+    setThemeMode(mode);
+    localStorage.setItem('df_theme', mode);
+    if (meQuery.data) {
+      api.savePreferences({ themePreference: mode }).catch(() => undefined);
+    }
+  };
+
+  const handleDensityChange = (d: DensityMode) => {
+    setDensity(d);
+    localStorage.setItem('df_density', d);
+    if (meQuery.data) {
+      api.savePreferences({ densityPreference: d }).catch(() => undefined);
+    }
+  };
+
+  if (meQuery.isLoading) {
+    return (
+      <FluentProvider theme={theme} style={{ minHeight: '100vh', padding: 32 }}>
+        <PageSkeleton cards={4} />
+      </FluentProvider>
+    );
+  }
+
+  if (!meQuery.data) {
+    return (
+      <FluentProvider theme={theme} style={{ minHeight: '100vh' }}>
+        <LoginPage
+          isDark={isDark}
+          themeMode={themeMode}
+          onToggleTheme={() => handleThemeChange(isDark ? 'light' : 'dark')}
+        />
+      </FluentProvider>
+    );
+  }
+
+  return (
+    <FluentProvider theme={theme} style={{ minHeight: '100vh', display: 'flex', flexDirection: 'column' }}>
+      <SignalRProvider>
+        <AuthenticatedWorkspace
+          me={meQuery.data}
+          isDark={isDark}
+          themeMode={themeMode}
+          density={density}
+          onThemeChange={handleThemeChange}
+          onDensityChange={handleDensityChange}
+        />
+      </SignalRProvider>
+    </FluentProvider>
+  );
+};
+
+const AuthenticatedWorkspace: React.FC<{
+  me: CurrentUser;
+  isDark: boolean;
+  themeMode: ThemeMode;
+  density: DensityMode;
+  onThemeChange: (m: ThemeMode) => void;
+  onDensityChange: (d: DensityMode) => void;
+}> = ({ me, isDark, themeMode, density, onThemeChange, onDensityChange }) => {
+  const navigate = useNavigate();
+  const location = useLocation();
+  const qc = useQueryClient();
+  const { connected } = useRealtime();
+
+  const [navCollapsed, setNavCollapsed] = useState(false);
+  const [searchOpen, setSearchOpen] = useState(false);
+  const [searchQuery, setSearchQuery] = useState('');
+  const [selectedRepoId, setSelectedRepoId] = useState<string>('');
+
+  // Ctrl+K Global Search shortcut
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k') {
@@ -113,7 +188,6 @@ export const AppShell: React.FC = () => {
     return () => window.removeEventListener('keydown', onKeyDown);
   }, []);
 
-  const meQuery = useQuery({ queryKey: ['me'], queryFn: api.getMe });
   const statusQuery = useQuery({ queryKey: ['factoryStatus'], queryFn: api.getFactoryStatus });
   const reposQuery = useQuery({ queryKey: ['repos'], queryFn: api.getRepos });
   const projectsQuery = useQuery({ queryKey: ['projects'], queryFn: api.getProjects });
@@ -145,17 +219,13 @@ export const AppShell: React.FC = () => {
     }
   });
 
-  const handleThemeChange = (mode: ThemeMode) => {
-    setThemeMode(mode);
-    localStorage.setItem('df_theme', mode);
-    api.savePreferences({ themePreference: mode }).catch(() => undefined);
-  };
-
-  const handleDensityChange = (d: DensityMode) => {
-    setDensity(d);
-    localStorage.setItem('df_density', d);
-    api.savePreferences({ densityPreference: d }).catch(() => undefined);
-  };
+  const logoutMutation = useMutation({
+    mutationFn: api.logout,
+    onSuccess: () => {
+      qc.setQueryData(['me'], null);
+      qc.removeQueries({ predicate: q => q.queryKey[0] !== 'me' && q.queryKey[0] !== 'authConfig' });
+    }
+  });
 
   const stoppedRepos = repos.filter(r => r.lineStatus === 'LineStopped');
   const factoryStatus = statusQuery.data?.status ?? 'Running';
@@ -170,13 +240,13 @@ export const AppShell: React.FC = () => {
   );
 
   return (
-    <FluentProvider theme={theme} style={{ minHeight: '100vh', display: 'flex', flexDirection: 'column' }}>
+    <>
       <AndonBanner
         stoppedRepos={stoppedRepos}
         reconnectRequired={Boolean(statusQuery.data?.reconnectRequired)}
       />
 
-      {/* Top App Bar (§14.1) */}
+      {/* Top App Bar */}
       <header
         style={{
           height: 54,
@@ -248,10 +318,41 @@ export const AppShell: React.FC = () => {
             appearance="subtle"
             aria-label="Toggle light or dark theme"
             icon={isDark ? <WeatherSunny20Regular /> : <WeatherMoon20Regular />}
-            onClick={() => handleThemeChange(isDark ? 'light' : 'dark')}
+            onClick={() => onThemeChange(isDark ? 'light' : 'dark')}
           />
 
-          <Avatar name={meQuery.data?.login ?? 'Operator'} size={28} color="brand" />
+          <Menu>
+            <MenuTrigger disableButtonEnhancement>
+              <Button appearance="subtle" style={{ padding: '2px 8px', gap: 8 }} aria-label="Account menu">
+                <Avatar
+                  name={me.login}
+                  image={me.avatarUrl ? { src: me.avatarUrl } : undefined}
+                  size={28}
+                  color="brand"
+                />
+                <Text size={200} weight="semibold">
+                  @{me.login}
+                </Text>
+              </Button>
+            </MenuTrigger>
+            <MenuPopover>
+              <MenuList>
+                <div style={{ padding: '6px 12px' }}>
+                  <Text weight="semibold" block>
+                    @{me.login}
+                  </Text>
+                  <Text size={200} style={{ color: tokens.colorNeutralForeground3 }}>
+                    Role: {me.role} · Auth: {me.authMode ?? 'Session'}
+                  </Text>
+                </div>
+                <MenuDivider />
+                <MenuItem onClick={() => navigate('/policies')}>GitHub Connection &amp; Policies</MenuItem>
+                <MenuItem icon={<SignOut20Regular />} onClick={() => logoutMutation.mutate()}>
+                  Sign out
+                </MenuItem>
+              </MenuList>
+            </MenuPopover>
+          </Menu>
         </div>
       </header>
 
@@ -322,9 +423,9 @@ export const AppShell: React.FC = () => {
               element={
                 <SettingsPage
                   themeMode={themeMode}
-                  onThemeChange={handleThemeChange}
+                  onThemeChange={onThemeChange}
                   density={density}
-                  onDensityChange={handleDensityChange}
+                  onDensityChange={onDensityChange}
                 />
               }
             />
@@ -376,6 +477,6 @@ export const AppShell: React.FC = () => {
           </DialogBody>
         </DialogSurface>
       </Dialog>
-    </FluentProvider>
+    </>
   );
 };

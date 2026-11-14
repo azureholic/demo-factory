@@ -74,10 +74,10 @@ export const SpecPage: React.FC<{ projectId?: string }> = ({ projectId }) => {
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 12 }}>
         <div>
           <Text size={600} weight="bold" block>
-            Living Specification & Traceability (§6.3)
+            Living Specification &amp; Traceability
           </Text>
           <Text size={200} style={{ color: tokens.colorNeutralForeground3 }}>
-            Current tag: <code>spec-v{specQuery.data?.currentSpecVersion}</code> · Protected path enforced by Gate Condition 6
+            Current tag: <code>spec-v{specQuery.data?.currentSpecVersion}</code> · Protected path enforced by review gate
           </Text>
         </div>
         <Button

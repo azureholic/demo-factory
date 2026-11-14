@@ -4,6 +4,8 @@ using DemoFactory.Domain;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
+using OpenTelemetry;
 using OpenTelemetry.Metrics;
 using OpenTelemetry.Trace;
 
@@ -42,6 +44,15 @@ public static class InfrastructureServiceCollectionExtensions
         services.AddSingleton<IAuditLogger, AuditLogger>();
         services.AddSingleton<IPreviewHostingService, PreviewHostingService>();
 
+        services.AddLogging(logging =>
+        {
+            logging.AddOpenTelemetry(otel =>
+            {
+                otel.IncludeFormattedMessage = true;
+                otel.IncludeScopes = true;
+            });
+        });
+
         var otelBuilder = services.AddOpenTelemetry()
             .WithTracing(t => t
                 .AddSource("DemoFactory.*")
@@ -52,6 +63,11 @@ public static class InfrastructureServiceCollectionExtensions
                 .AddMeter("DemoFactory.*")
                 .AddAspNetCoreInstrumentation()
                 .AddHttpClientInstrumentation());
+
+        if (!string.IsNullOrWhiteSpace(configuration["OTEL_EXPORTER_OTLP_ENDPOINT"]))
+        {
+            otelBuilder.UseOtlpExporter();
+        }
 
         if (!string.IsNullOrWhiteSpace(configuration["APPLICATIONINSIGHTS_CONNECTION_STRING"]))
         {
@@ -85,7 +101,7 @@ public static class DemoFactorySeeder
                     Enabled = true,
                     SmokeTestPassed = true,
                     LastSmokeTestedAt = now.AddHours(-3),
-                    Notes = "Default coding model (§1, §9.4). Usage-based billing on Copilot Pro+/Max."
+                    Notes = "Default coding model. Usage-based billing on Copilot Pro+ and Max."
                 },
                 new ModelCatalogueEntity
                 {

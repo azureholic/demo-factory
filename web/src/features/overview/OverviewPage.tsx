@@ -86,7 +86,7 @@ export const OverviewPage: React.FC<{ selectedRepoId?: string }> = () => {
         </div>
       </div>
 
-      {/* 8 KPI Cards (§14.2 Screen 1) */}
+      {/* KPI Cards */}
       <div
         style={{
           display: 'grid',
@@ -129,7 +129,7 @@ export const OverviewPage: React.FC<{ selectedRepoId?: string }> = () => {
             header={
               <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
                 <Text size={400} weight="semibold">
-                  Approvals Inbox (Gate Condition 14)
+                  Approvals Inbox
                 </Text>
                 <Badge appearance="filled" color={approvals.length + proposals.length > 0 ? 'warning' : 'success'}>
                   {approvals.length + proposals.length}

@@ -67,7 +67,7 @@ export const WorkItemDetailPage: React.FC = () => {
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
-      {/* Header & Operator Actions (§14.2 Screen 4) */}
+      {/* Header & Operator Actions */}
       <Card style={{ padding: 16 }}>
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', flexWrap: 'wrap', gap: 12 }}>
           <div>
@@ -359,7 +359,7 @@ export const WorkItemDetailPage: React.FC = () => {
             <DialogTitle>Waive Review Finding</DialogTitle>
             <DialogContent style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
               <Text size={200}>
-                A mandatory audit reason is required to waive a Copilot code review finding (§14.2 Screen 4).
+                A mandatory audit reason is required to waive a Copilot code review finding.
               </Text>
               <Input
                 placeholder="Explain why this finding is safe to waive..."

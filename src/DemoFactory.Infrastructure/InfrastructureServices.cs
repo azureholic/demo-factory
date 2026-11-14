@@ -27,7 +27,9 @@ public sealed class FactoryEnvironmentOptions
     public string PreviewsSubscriptionId { get; set; } = string.Empty;
     public string PreviewsResourceGroup { get; set; } = "rg-demo-factory-previews";
     public string ManagedIdentityClientId { get; set; } = string.Empty;
+    public string LocalDataDirectory { get; set; } = string.Empty;
     public bool SandboxMode { get; set; } = true;
+    public bool AllowTestHeaderAuth { get; set; } = false;
 }
 
 public interface IEvidenceStore

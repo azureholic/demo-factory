@@ -29,6 +29,12 @@ param principalType string = 'User'
 @description('GitHub login of the personal account owning managed demo repositories (§1)')
 param ownerLogin string = 'azureholic'
 
+@description('GitHub App slug registered for Demo-Factory (§10.1)')
+param factoryAppSlug string = 'azureholic-demo-factory'
+
+@description('Numeric GitHub App ID used for JWT signing & pinning demo-factory/review-gate (§10.2)')
+param githubAppId string = '5758548'
+
 var uniqueHash = take(uniqueString(subscription().id, resourceGroup().id, environmentName), 8)
 var prefix = 'df-${toLower(environmentName)}-${uniqueHash}'
 var isReference = deploymentProfile == 'reference'
@@ -368,6 +374,10 @@ var commonEnvVars = [
     value: ownerLogin
   }
   {
+    name: 'Factory__FactoryAppSlug'
+    value: factoryAppSlug
+  }
+  {
     name: 'Factory__SandboxMode'
     value: 'false'
   }
@@ -378,6 +388,18 @@ var commonEnvVars = [
   {
     name: 'Factory__EvidenceBlobServiceUri'
     value: evidenceStorage.properties.primaryEndpoints.blob
+  }
+  {
+    name: 'GitHub__AppId'
+    value: githubAppId
+  }
+  {
+    name: 'GitHub__AppSlug'
+    value: factoryAppSlug
+  }
+  {
+    name: 'GitHub__DemoFactoryIntegrationId'
+    value: githubAppId
   }
   {
     name: 'GitHub__ManagedIdentityClientId'

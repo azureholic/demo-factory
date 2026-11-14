@@ -33,7 +33,7 @@ export const AuditPage: React.FC = () => {
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 12 }}>
         <div>
           <Text size={600} weight="bold" block>
-            Append-Only Audit Log (§7.2, §14.2 Screen 8)
+            Append-Only Audit Log
           </Text>
           <Text size={200} style={{ color: tokens.colorNeutralForeground3 }}>
             Full traceability across issues, sessions, review rounds, gate evaluations, and merges

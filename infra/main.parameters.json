@@ -22,6 +22,12 @@
     },
     "ownerLogin": {
       "value": "${FACTORY_OWNER_LOGIN=azureholic}"
+    },
+    "factoryAppSlug": {
+      "value": "${FACTORY_APP_SLUG=azureholic-demo-factory}"
+    },
+    "githubAppId": {
+      "value": "${GITHUB_APP_ID=5758548}"
     }
   }
 }

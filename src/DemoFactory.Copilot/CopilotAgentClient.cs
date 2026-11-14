@@ -329,7 +329,7 @@ public sealed class CopilotAgentClient(
 
         if (active)
         {
-            throw new InvalidOperationException($"WorkItem {workItemId} already has an active Copilot session (Queued/InProgress). Concurrent sessions on the same PR are prohibited (§8.2).");
+            throw new InvalidOperationException($"WorkItem {workItemId} already has an active Copilot session (Queued/InProgress). Concurrent sessions on the same PR are prohibited.");
         }
     }
 

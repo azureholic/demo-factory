@@ -78,7 +78,7 @@ export const BoardPage: React.FC<{ repoId?: string; projectId?: string }> = ({ r
             Project Board — {boardQuery.data?.repoFullName}
           </Text>
           <Text size={200} style={{ color: tokens.colorNeutralForeground3 }}>
-            Mirrors GitHub Projects v2. Humans may drag between Backlog, Ready, and Blocked; agent columns are locked (§14.2).
+            Mirrors GitHub Projects v2. Humans may drag between Backlog, Ready, and Blocked; agent columns are locked.
           </Text>
         </div>
         <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>

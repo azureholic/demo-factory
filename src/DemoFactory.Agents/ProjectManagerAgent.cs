@@ -483,7 +483,7 @@ public sealed partial class ProjectManagerAgent(
                 if (!string.IsNullOrWhiteSpace(acceptanceContractMarkdown))
                 {
                     sb.AppendLine();
-                    sb.AppendLine("## Locked Acceptance Interface Contract (§6.1)");
+                    sb.AppendLine("## Locked Acceptance Interface Contract");
                     sb.AppendLine(acceptanceContractMarkdown);
                 }
 

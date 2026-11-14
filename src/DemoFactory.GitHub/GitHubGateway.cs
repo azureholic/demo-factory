@@ -730,7 +730,7 @@ public sealed class GitHubGateway(
         var allowed = await db.Repositories.AnyAsync(r => r.Owner == owner && r.Name == repo, ct);
         if (!allowed)
         {
-            throw new InvalidOperationException($"Repository '{owner}/{repo}' is not on the Demo-Factory SQL allowlist (§10.1).");
+            throw new InvalidOperationException($"Repository '{owner}/{repo}' is not on the Demo-Factory SQL allowlist.");
         }
     }
 

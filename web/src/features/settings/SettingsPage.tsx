@@ -33,7 +33,7 @@ export const SettingsPage: React.FC<{
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 16, maxWidth: 760 }}>
       <Text size={600} weight="bold">
-        Operator Preferences & Notifications (§14.1, §14.2 Screen 9)
+        Operator Preferences &amp; Notifications
       </Text>
 
       <Card style={{ padding: 16, display: 'flex', flexDirection: 'column', gap: 14 }}>

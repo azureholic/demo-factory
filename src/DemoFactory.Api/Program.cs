@@ -59,12 +59,13 @@ if (!string.IsNullOrWhiteSpace(builder.Configuration["Azure:SignalR:ConnectionSt
 }
 
 var isLeanProfile = !string.Equals(builder.Configuration["Factory:Profile"], nameof(DeploymentProfile.Reference), StringComparison.OrdinalIgnoreCase);
+var registerBackgroundWorkers = builder.Configuration.GetValue<bool?>("Factory:RegisterBackgroundWorkers") ?? isLeanProfile;
 
 builder.Services.AddDemoFactoryInfrastructure(builder.Configuration);
 builder.Services.AddDemoFactoryGitHub(builder.Configuration);
 builder.Services.AddDemoFactoryCopilot();
 builder.Services.AddDemoFactoryAgents(builder.Configuration);
-builder.Services.AddDemoFactoryOrchestrator(builder.Configuration, registerBackgroundWorkers: isLeanProfile);
+builder.Services.AddDemoFactoryOrchestrator(builder.Configuration, registerBackgroundWorkers: registerBackgroundWorkers);
 builder.Services.AddSingleton<IRealtimeNotifier, SignalRRealtimeNotifier>();
 
 var app = builder.Build();
@@ -84,11 +85,11 @@ app.UseStaticFiles();
 
 app.UseAuthentication();
 
-// In SandboxMode, support convenient auto-authentication for local operator UX and role-testing headers in E2E tests
+// Automated test-harness header authentication (enabled strictly in WebApplicationFactory E2E tests via Factory:AllowTestHeaderAuth)
 app.Use(async (ctx, next) =>
 {
     var envOpts = ctx.RequestServices.GetRequiredService<IOptions<FactoryEnvironmentOptions>>().Value;
-    if (envOpts.SandboxMode && ctx.User.Identity?.IsAuthenticated != true)
+    if (envOpts.AllowTestHeaderAuth && ctx.User.Identity?.IsAuthenticated != true)
     {
         if (ctx.Request.Headers.TryGetValue("X-Test-Unauthenticated", out var unauth) && unauth == "true")
         {
@@ -121,7 +122,12 @@ app.MapProjectAndFeatureEndpoints();
 app.MapOperationsAndGovernanceEndpoints();
 app.MapHub<FactoryHub>("/hubs/factory");
 
-if (File.Exists(Path.Combine(app.Environment.WebRootPath ?? "wwwroot", "index.html")))
+if (!string.IsNullOrWhiteSpace(builder.Configuration["Factory:FrontendDevUrl"]))
+{
+    var devUrl = builder.Configuration["Factory:FrontendDevUrl"]!;
+    app.MapGet("/", () => Results.Redirect(devUrl)).ExcludeFromDescription();
+}
+else if (File.Exists(Path.Combine(app.Environment.WebRootPath ?? "wwwroot", "index.html")))
 {
     app.MapFallbackToFile("index.html");
 }

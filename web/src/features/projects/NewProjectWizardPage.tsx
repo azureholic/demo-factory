@@ -156,7 +156,7 @@ export const NewProjectWizardPage: React.FC = () => {
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
         <div>
           <Text size={600} weight="bold" block>
-            New Project Wizard (§5.1)
+            New Project Wizard
           </Text>
           <Text size={200} style={{ color: tokens.colorNeutralForeground3 }}>
             Step {step} of 5 · Spec → Clarification & Public-Safe Check → Stack & Policy → Plan Review → Bootstrap Launch
@@ -283,7 +283,7 @@ export const NewProjectWizardPage: React.FC = () => {
           </Text>
           <div>
             <Text weight="semibold" block style={{ marginBottom: 4 }}>
-              Golden-Path Template (§5.2)
+              Golden-Path Template
             </Text>
             <Dropdown
               value={templateId}
@@ -299,7 +299,7 @@ export const NewProjectWizardPage: React.FC = () => {
 
           <div>
             <Text weight="semibold" block style={{ marginBottom: 4 }}>
-              Autonomy Level (§11.3)
+              Autonomy Level
             </Text>
             <Dropdown
               value={autonomy}
@@ -313,7 +313,7 @@ export const NewProjectWizardPage: React.FC = () => {
 
           <div>
             <Text weight="semibold" block style={{ marginBottom: 4 }}>
-              Default Coding Model (§9.4)
+              Default Coding Model
             </Text>
             <Dropdown
               value={codingModel}

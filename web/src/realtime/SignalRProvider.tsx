@@ -68,21 +68,27 @@ export const SignalRProvider: React.FC<{ children: React.ReactNode }> = ({ child
     });
 
     let active = true;
-    conn
-      .start()
-      .then(() => {
-        if (active) setConnected(true);
-      })
-      .catch(() => {
-        if (active) setConnected(false);
-      });
+    const startTimer = window.setTimeout(() => {
+      if (!active) return;
+      conn
+        .start()
+        .then(() => {
+          if (active) setConnected(true);
+        })
+        .catch(() => {
+          if (active) setConnected(false);
+        });
+    }, 50);
 
     conn.onreconnected(() => setConnected(true));
     conn.onclose(() => setConnected(false));
 
     return () => {
       active = false;
-      conn.stop().catch(() => undefined);
+      window.clearTimeout(startTimer);
+      if (conn.state !== signalR.HubConnectionState.Disconnected) {
+        conn.stop().catch(() => undefined);
+      }
     };
   }, [queryClient]);
 

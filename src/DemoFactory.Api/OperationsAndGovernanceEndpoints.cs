@@ -553,7 +553,7 @@ public static class OperationsAndGovernanceEndpoints
                 case "waive-finding":
                     var waiveReq = await ProjectAndFeatureEndpoints.ReadJsonOrDefaultAsync<WaiveFindingRequest>(http.Request, ct);
                     if (waiveReq is null || string.IsNullOrWhiteSpace(waiveReq.Reason) || string.IsNullOrWhiteSpace(waiveReq.Fingerprint))
-                        return Results.BadRequest(new { error = "Waiving a finding requires both fingerprint and a non-empty reason (§14.2 Screen 4)." });
+                        return Results.BadRequest(new { error = "Waiving a finding requires both fingerprint and a non-empty reason." });
 
                     var finding = await db.Findings.FirstOrDefaultAsync(
                         f => f.WorkItemId == wi.Id && (f.Fingerprint == waiveReq.Fingerprint || f.ShortId == waiveReq.Fingerprint), ct);
@@ -644,7 +644,7 @@ public static class OperationsAndGovernanceEndpoints
                     {
                         return Results.BadRequest(new
                         {
-                            error = $"Column '{wi.BoardStatus}' -> '{moveReq.ToStatus}' is locked. Humans may drag only between Backlog, Ready, and Blocked (§14.2 Screen 2)."
+                            error = $"Column '{wi.BoardStatus}' -> '{moveReq.ToStatus}' is locked. Humans may drag only between Backlog, Ready, and Blocked."
                         });
                     }
 

@@ -1,0 +1,68 @@
+repository: azureholic/contoso-fleet-optimizer-demo
+project:
+  owner: azureholic
+  number: 1
+autonomy: L1
+wip: 1
+boardPollSeconds: 60
+workLabel: factory
+pmCanReorder: false
+touchSetOverlapThreshold: 0.35
+hasDeployTarget: true
+intake:
+  acceptOutsideIssues: true
+  closeSourceIssuesWhenDone: true
+models:
+  coding: gemini-4-carbon
+  pm: foundry/gpt-4.1
+review:
+  blockingSeverity: Medium
+  maxRounds: 3
+  contestedPolicy:
+    low: allow
+    medium: allow
+    high: block
+gate:
+  requiredChecks:
+  - build
+  - test
+  - lint
+  maxChangedLines: 1500
+  specConformance: true
+acceptanceTests:
+  separateIssueMinSize: Medium
+  maxFixes: 2
+protectedPaths:
+- .github/**
+- scripts/**
+- tests/acceptance/_harness/**
+- docs/spec.md
+- docs/features/**
+- CODEOWNERS
+- .editorconfig
+- eslint.config.*
+- '**/*.ruleset.json'
+allowedGitHubActions:
+- actions/checkout
+- actions/setup-dotnet
+- actions/setup-node
+- actions/setup-python
+- actions/upload-artifact
+- actions/download-artifact
+- azure/login
+- azure/container-apps-deploy-action
+- github/codeql-action
+trustedActors:
+- owner
+- copilot-swe-agent
+- copilot-pull-request-reviewer
+- dependabot
+budget:
+  dailySessions: 40
+  maxSessionsPerItem: 5
+  dailySpendUsd: 25
+  spendPerItemUsd: 5
+riskLabels:
+- area:auth
+- area:infra
+- deps

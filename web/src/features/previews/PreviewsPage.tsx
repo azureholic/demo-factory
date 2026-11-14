@@ -43,7 +43,7 @@ export const PreviewsPage: React.FC<{ project?: ProjectSummary; repoId?: string 
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 12 }}>
         <div>
           <Text size={600} weight="bold" block>
-            Previews, Demo Environment & Andon Drills (§6.2, §6.4)
+            Previews, Demo Environment &amp; Andon Drills
           </Text>
           <Text size={200} style={{ color: tokens.colorNeutralForeground3 }}>
             Scale-to-zero Azure Container Apps deployed by digest from trusted workflow_run; swept after 72h or PR close.

@@ -27,6 +27,7 @@ public sealed class GitHubAppOptions
     public string OAuthRedirectUri { get; set; } = "http://localhost:5180/auth/github/callback";
     public string KeyVaultSigningKeyId { get; set; } = string.Empty;
     public string KeyVaultWrapKeyId { get; set; } = string.Empty;
+    public string PrivateKeyPem { get; set; } = string.Empty;
     public string LocalEncryptionPassphrase { get; set; } = "demo-factory-local-dev-key-material-32b!";
     public string ManagedIdentityClientId { get; set; } = string.Empty;
     public int WritePaceMilliseconds { get; set; } = 1000;
@@ -96,6 +97,12 @@ public sealed class GitHubAppJwtSigner(IOptions<GitHubAppOptions> options) : IGi
             var crypto = new CryptographyClient(keyUri, credential);
             var signResult = await crypto.SignAsync(SignatureAlgorithm.RS256, digest, ct);
             signature = signResult.Signature;
+        }
+        else if (!string.IsNullOrWhiteSpace(options.Value.PrivateKeyPem))
+        {
+            using var pemRsa = RSA.Create();
+            pemRsa.ImportFromPem(options.Value.PrivateKeyPem);
+            signature = pemRsa.SignHash(digest, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
         }
         else
         {
@@ -189,10 +196,21 @@ public sealed record DelegatedTokenStatus(
     DateTimeOffset? RefreshTokenExpiresAt,
     bool ReconnectRequired);
 
+public sealed record GitHubOAuthSessionResult(
+    string Login,
+    string? AvatarUrl,
+    string AuthMode);
+
 public interface ITokenBroker
 {
-    string BuildAuthorizeUrl(string state);
-    Task<string> CompleteOAuthCodeExchangeAsync(string code, CancellationToken ct = default);
+    bool IsGitHubOAuthConfigured { get; }
+    string ActiveClientId { get; }
+    string ActiveAppSlug { get; }
+    string BuildAuthorizeUrl(string state, string? redirectUriOverride = null);
+    Task ConfigureGitHubCredentialsAsync(string clientId, string clientSecret, string? appId = null, string? appSlug = null, string? webhookSecret = null, string? privateKeyPem = null, CancellationToken ct = default);
+    Task<string> CompleteManifestConversionAsync(string manifestCode, CancellationToken ct = default);
+    Task<GitHubOAuthSessionResult> CompleteOAuthCodeExchangeAsync(string code, string? redirectUriOverride = null, CancellationToken ct = default);
+    Task<GitHubOAuthSessionResult> CompleteSandboxSignInAsync(string login, CancellationToken ct = default);
     Task<string> GetDelegatedAccessTokenAsync(string gitHubLogin, CancellationToken ct = default);
     Task<DelegatedTokenStatus> GetConnectionStatusAsync(string gitHubLogin, CancellationToken ct = default);
     Task StoreRotatedTokensAsync(string gitHubLogin, string accessToken, TimeSpan accessLifetime, string refreshToken, TimeSpan refreshLifetime, CancellationToken ct = default);
@@ -206,51 +224,164 @@ public interface ITokenBroker
 /// - Persists encrypted refresh token BEFORE dropping old access token.
 /// - Pauses all projects immediately when refresh fails or authorization is revoked.
 /// </summary>
-public sealed class TokenBroker(
-    IDbContextFactory<DemoFactoryDbContext> dbFactory,
-    ITokenProtector protector,
-    IAuditLogger auditLogger,
-    IHttpClientFactory httpClientFactory,
-    IOptions<GitHubAppOptions> appOptions,
-    IOptions<FactoryEnvironmentOptions> envOptions,
-    ILogger<TokenBroker> logger) : ITokenBroker
+public sealed class TokenBroker : ITokenBroker
 {
     private sealed record CachedAccessToken(string AccessToken, DateTimeOffset ExpiresAt);
+    private sealed record PersistedOAuthConfig(
+        string ClientId,
+        string EncryptedClientSecret,
+        string? AppId,
+        string? AppSlug,
+        string? EncryptedWebhookSecret,
+        string? EncryptedPrivateKeyPem = null);
 
+    private readonly IDbContextFactory<DemoFactoryDbContext> _dbFactory;
+    private readonly ITokenProtector _protector;
+    private readonly IAuditLogger _auditLogger;
+    private readonly IHttpClientFactory _httpClientFactory;
+    private readonly GitHubAppOptions _appOptions;
+    private readonly FactoryEnvironmentOptions _envOptions;
+    private readonly ILogger<TokenBroker> _logger;
     private readonly ConcurrentDictionary<string, CachedAccessToken> _memoryCache = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, SemaphoreSlim> _userLocks = new(StringComparer.OrdinalIgnoreCase);
+    private readonly string _oauthConfigFilePath;
 
-    public string BuildAuthorizeUrl(string state)
+    public TokenBroker(
+        IDbContextFactory<DemoFactoryDbContext> dbFactory,
+        ITokenProtector protector,
+        IAuditLogger auditLogger,
+        IHttpClientFactory httpClientFactory,
+        IOptions<GitHubAppOptions> appOptions,
+        IOptions<FactoryEnvironmentOptions> envOptions,
+        ILogger<TokenBroker> logger)
     {
-        var clientId = Uri.EscapeDataString(appOptions.Value.ClientId);
-        var redirect = Uri.EscapeDataString(appOptions.Value.OAuthRedirectUri);
+        _dbFactory = dbFactory;
+        _protector = protector;
+        _auditLogger = auditLogger;
+        _httpClientFactory = httpClientFactory;
+        _appOptions = appOptions.Value;
+        _envOptions = envOptions.Value;
+        _logger = logger;
+
+        var dataDir = !string.IsNullOrWhiteSpace(_envOptions.LocalDataDirectory)
+            ? _envOptions.LocalDataDirectory
+            : Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "DemoFactory");
+        Directory.CreateDirectory(dataDir);
+        _oauthConfigFilePath = Path.Combine(dataDir, "github-oauth.json");
+
+        TryLoadPersistedOAuthConfig();
+    }
+
+    public bool IsGitHubOAuthConfigured =>
+        !string.IsNullOrWhiteSpace(_appOptions.ClientId)
+        && !_appOptions.ClientId.Equals("Iv23liDemoFactoryLocal", StringComparison.OrdinalIgnoreCase)
+        && !string.IsNullOrWhiteSpace(_appOptions.ClientSecret);
+
+    public string ActiveClientId => _appOptions.ClientId;
+    public string ActiveAppSlug => _appOptions.AppSlug;
+
+    public string BuildAuthorizeUrl(string state, string? redirectUriOverride = null)
+    {
+        TryLoadPersistedOAuthConfig();
+        var clientId = Uri.EscapeDataString(_appOptions.ClientId);
+        var redirect = Uri.EscapeDataString(string.IsNullOrWhiteSpace(redirectUriOverride) ? _appOptions.OAuthRedirectUri : redirectUriOverride);
         return $"https://github.com/login/oauth/authorize?client_id={clientId}&redirect_uri={redirect}&state={Uri.EscapeDataString(state)}";
     }
 
-    public async Task<string> CompleteOAuthCodeExchangeAsync(string code, CancellationToken ct = default)
+    public async Task ConfigureGitHubCredentialsAsync(
+        string clientId,
+        string clientSecret,
+        string? appId = null,
+        string? appSlug = null,
+        string? webhookSecret = null,
+        string? privateKeyPem = null,
+        CancellationToken ct = default)
     {
-        if (envOptions.Value.SandboxMode || string.IsNullOrWhiteSpace(appOptions.Value.ClientSecret))
+        _appOptions.ClientId = clientId.Trim();
+        _appOptions.ClientSecret = clientSecret.Trim();
+        if (!string.IsNullOrWhiteSpace(appId))
         {
-            var login = envOptions.Value.OwnerLogin;
-            await StoreRotatedTokensAsync(
-                login,
-                $"ghu_sandbox_{Guid.NewGuid():N}",
-                TimeSpan.FromHours(8),
-                $"ghr_sandbox_{Guid.NewGuid():N}",
-                TimeSpan.FromDays(180),
-                ct);
-            return login;
+            _appOptions.AppId = appId.Trim();
+            if (long.TryParse(_appOptions.AppId, out var parsedId))
+                _appOptions.DemoFactoryIntegrationId = parsedId;
+        }
+        if (!string.IsNullOrWhiteSpace(appSlug))
+        {
+            _appOptions.AppSlug = appSlug.Trim();
+            _envOptions.FactoryAppSlug = _appOptions.AppSlug;
+        }
+        if (!string.IsNullOrWhiteSpace(webhookSecret))
+            _appOptions.WebhookSecret = webhookSecret.Trim();
+        if (!string.IsNullOrWhiteSpace(privateKeyPem))
+            _appOptions.PrivateKeyPem = privateKeyPem;
+
+        var persisted = new PersistedOAuthConfig(
+            _appOptions.ClientId,
+            await _protector.EncryptRefreshTokenAsync(_appOptions.ClientSecret, ct),
+            _appOptions.AppId,
+            _appOptions.AppSlug,
+            string.IsNullOrWhiteSpace(webhookSecret) ? null : await _protector.EncryptRefreshTokenAsync(_appOptions.WebhookSecret, ct),
+            string.IsNullOrWhiteSpace(privateKeyPem) ? null : await _protector.EncryptRefreshTokenAsync(privateKeyPem, ct));
+
+        await File.WriteAllTextAsync(_oauthConfigFilePath, JsonSerializer.Serialize(persisted), ct);
+    }
+
+    public async Task<string> CompleteManifestConversionAsync(string manifestCode, CancellationToken ct = default)
+    {
+        using var http = _httpClientFactory.CreateClient("GitHubOAuth");
+        using var req = new HttpRequestMessage(HttpMethod.Post, $"https://api.github.com/app-manifests/{Uri.EscapeDataString(manifestCode)}/conversions");
+        req.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/vnd.github+json"));
+        req.Headers.UserAgent.ParseAdd("Demo-Factory/0.8");
+
+        using var resp = await http.SendAsync(req, ct);
+        resp.EnsureSuccessStatusCode();
+        using var doc = await JsonDocument.ParseAsync(await resp.Content.ReadAsStreamAsync(ct), cancellationToken: ct);
+        var root = doc.RootElement;
+
+        var appId = root.GetProperty("id").GetRawText();
+        var slug = root.TryGetProperty("slug", out var sl) && sl.ValueKind == JsonValueKind.String ? sl.GetString() ?? "demo-factory" : "demo-factory";
+        var clientId = root.GetProperty("client_id").GetString() ?? throw new InvalidOperationException("Manifest conversion missing client_id");
+        var clientSecret = root.GetProperty("client_secret").GetString() ?? throw new InvalidOperationException("Manifest conversion missing client_secret");
+        var webhookSecret = root.TryGetProperty("webhook_secret", out var ws) && ws.ValueKind == JsonValueKind.String ? ws.GetString() : null;
+        var pem = root.TryGetProperty("pem", out var pm) && pm.ValueKind == JsonValueKind.String ? pm.GetString() : null;
+
+        await ConfigureGitHubCredentialsAsync(clientId, clientSecret, appId, slug, webhookSecret, pem, ct);
+        return slug;
+    }
+
+    public async Task<GitHubOAuthSessionResult> CompleteSandboxSignInAsync(string login, CancellationToken ct = default)
+    {
+        var cleanLogin = string.IsNullOrWhiteSpace(login) ? _envOptions.OwnerLogin : login.Trim();
+        await StoreRotatedTokensAsync(
+            cleanLogin,
+            $"ghu_sandbox_{Guid.NewGuid():N}",
+            TimeSpan.FromHours(8),
+            $"ghr_sandbox_{Guid.NewGuid():N}",
+            TimeSpan.FromDays(180),
+            ct);
+        return new GitHubOAuthSessionResult(cleanLogin, $"https://github.com/{Uri.EscapeDataString(cleanLogin)}.png?size=64", "Sandbox");
+    }
+
+    public async Task<GitHubOAuthSessionResult> CompleteOAuthCodeExchangeAsync(string code, string? redirectUriOverride = null, CancellationToken ct = default)
+    {
+        TryLoadPersistedOAuthConfig();
+
+        if (!IsGitHubOAuthConfigured)
+        {
+            return await CompleteSandboxSignInAsync(_envOptions.OwnerLogin, ct);
         }
 
-        using var http = httpClientFactory.CreateClient("GitHubOAuth");
+        var redirectUri = string.IsNullOrWhiteSpace(redirectUriOverride) ? _appOptions.OAuthRedirectUri : redirectUriOverride;
+
+        using var http = _httpClientFactory.CreateClient("GitHubOAuth");
         using var req = new HttpRequestMessage(HttpMethod.Post, "https://github.com/login/oauth/access_token")
         {
             Content = JsonContent.Create(new
             {
-                client_id = appOptions.Value.ClientId,
-                client_secret = appOptions.Value.ClientSecret,
+                client_id = _appOptions.ClientId,
+                client_secret = _appOptions.ClientSecret,
                 code,
-                redirect_uri = appOptions.Value.OAuthRedirectUri
+                redirect_uri = redirectUri
             })
         };
         req.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
@@ -260,8 +391,16 @@ public sealed class TokenBroker(
         using var tokenDoc = await JsonDocument.ParseAsync(await resp.Content.ReadAsStreamAsync(ct), cancellationToken: ct);
         var root = tokenDoc.RootElement;
 
+        if (root.TryGetProperty("error", out var oauthErr))
+        {
+            var desc = root.TryGetProperty("error_description", out var ed) ? ed.GetString() : oauthErr.GetString();
+            throw new InvalidOperationException($"GitHub OAuth failed: {desc}");
+        }
+
         var accessToken = root.GetProperty("access_token").GetString() ?? throw new InvalidOperationException("Missing access_token");
-        var refreshToken = root.TryGetProperty("refresh_token", out var rt) ? rt.GetString() ?? string.Empty : string.Empty;
+        var refreshToken = root.TryGetProperty("refresh_token", out var rt) && !string.IsNullOrWhiteSpace(rt.GetString())
+            ? rt.GetString()!
+            : $"non_expiring:{accessToken}";
         var expiresIn = root.TryGetProperty("expires_in", out var ei) ? ei.GetInt32() : 28800;
         var refreshExpiresIn = root.TryGetProperty("refresh_token_expires_in", out var rei) ? rei.GetInt32() : 15552000;
 
@@ -272,6 +411,7 @@ public sealed class TokenBroker(
         userResp.EnsureSuccessStatusCode();
         using var userDoc = await JsonDocument.ParseAsync(await userResp.Content.ReadAsStreamAsync(ct), cancellationToken: ct);
         var loginName = userDoc.RootElement.GetProperty("login").GetString() ?? throw new InvalidOperationException("Missing GitHub login");
+        var avatarUrl = userDoc.RootElement.TryGetProperty("avatar_url", out var av) ? av.GetString() : null;
 
         await StoreRotatedTokensAsync(
             loginName,
@@ -281,7 +421,43 @@ public sealed class TokenBroker(
             TimeSpan.FromSeconds(refreshExpiresIn),
             ct);
 
-        return loginName;
+        return new GitHubOAuthSessionResult(loginName, avatarUrl, "GitHub");
+    }
+
+    private void TryLoadPersistedOAuthConfig()
+    {
+        if (IsGitHubOAuthConfigured || !File.Exists(_oauthConfigFilePath))
+            return;
+
+        try
+        {
+            var json = File.ReadAllText(_oauthConfigFilePath);
+            var persisted = JsonSerializer.Deserialize<PersistedOAuthConfig>(json);
+            if (persisted is null || string.IsNullOrWhiteSpace(persisted.ClientId) || string.IsNullOrWhiteSpace(persisted.EncryptedClientSecret))
+                return;
+
+            _appOptions.ClientId = persisted.ClientId;
+            _appOptions.ClientSecret = _protector.DecryptRefreshTokenAsync(persisted.EncryptedClientSecret).GetAwaiter().GetResult();
+            if (!string.IsNullOrWhiteSpace(persisted.AppId))
+            {
+                _appOptions.AppId = persisted.AppId;
+                if (long.TryParse(_appOptions.AppId, out var parsedId))
+                    _appOptions.DemoFactoryIntegrationId = parsedId;
+            }
+            if (!string.IsNullOrWhiteSpace(persisted.AppSlug))
+            {
+                _appOptions.AppSlug = persisted.AppSlug;
+                _envOptions.FactoryAppSlug = _appOptions.AppSlug;
+            }
+            if (!string.IsNullOrWhiteSpace(persisted.EncryptedWebhookSecret))
+                _appOptions.WebhookSecret = _protector.DecryptRefreshTokenAsync(persisted.EncryptedWebhookSecret).GetAwaiter().GetResult();
+            if (!string.IsNullOrWhiteSpace(persisted.EncryptedPrivateKeyPem))
+                _appOptions.PrivateKeyPem = _protector.DecryptRefreshTokenAsync(persisted.EncryptedPrivateKeyPem).GetAwaiter().GetResult();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Unable to read persisted GitHub OAuth config at {Path}", _oauthConfigFilePath);
+        }
     }
 
     public async Task<string> GetDelegatedAccessTokenAsync(string gitHubLogin, CancellationToken ct = default)
@@ -302,7 +478,7 @@ public sealed class TokenBroker(
                 return cached.AccessToken;
             }
 
-            await using var db = await dbFactory.CreateDbContextAsync(ct);
+            await using var db = await _dbFactory.CreateDbContextAsync(ct);
             var stored = await db.EncryptedUserTokens.FirstOrDefaultAsync(t => t.GitHubLogin == gitHubLogin, ct);
             if (stored is null || stored.IsRevoked || stored.RefreshTokenExpiresAt <= DateTimeOffset.UtcNow)
             {
@@ -310,9 +486,16 @@ public sealed class TokenBroker(
                 throw new InvalidOperationException("Reconnect GitHub: delegated user token is unavailable.");
             }
 
-            var refreshToken = await protector.DecryptRefreshTokenAsync(stored.EncryptedRefreshToken, ct);
+            var refreshToken = await _protector.DecryptRefreshTokenAsync(stored.EncryptedRefreshToken, ct);
+            if (refreshToken.StartsWith("non_expiring:", StringComparison.Ordinal))
+            {
+                var nonExpiringToken = refreshToken["non_expiring:".Length..];
+                _memoryCache[gitHubLogin] = new CachedAccessToken(nonExpiringToken, DateTimeOffset.UtcNow.AddHours(8));
+                return nonExpiringToken;
+            }
 
-            if (envOptions.Value.SandboxMode || string.IsNullOrWhiteSpace(appOptions.Value.ClientSecret))
+            TryLoadPersistedOAuthConfig();
+            if (!IsGitHubOAuthConfigured)
             {
                 var sandboxAccess = $"ghu_sandbox_{Guid.NewGuid():N}";
                 var sandboxRefresh = $"ghr_sandbox_{Guid.NewGuid():N}";
@@ -327,13 +510,13 @@ public sealed class TokenBroker(
             }
 
             // Refresh via GitHub App OAuth endpoint
-            using var http = httpClientFactory.CreateClient("GitHubOAuth");
+            using var http = _httpClientFactory.CreateClient("GitHubOAuth");
             using var req = new HttpRequestMessage(HttpMethod.Post, "https://github.com/login/oauth/access_token")
             {
                 Content = JsonContent.Create(new
                 {
-                    client_id = appOptions.Value.ClientId,
-                    client_secret = appOptions.Value.ClientSecret,
+                    client_id = _appOptions.ClientId,
+                    client_secret = _appOptions.ClientSecret,
                     grant_type = "refresh_token",
                     refresh_token = refreshToken
                 })
@@ -356,7 +539,9 @@ public sealed class TokenBroker(
             }
 
             var newAccess = doc.RootElement.GetProperty("access_token").GetString()!;
-            var newRefresh = doc.RootElement.GetProperty("refresh_token").GetString()!;
+            var newRefresh = doc.RootElement.TryGetProperty("refresh_token", out var nrt) && !string.IsNullOrWhiteSpace(nrt.GetString())
+                ? nrt.GetString()!
+                : $"non_expiring:{newAccess}";
             var expiresIn = doc.RootElement.TryGetProperty("expires_in", out var ei) ? ei.GetInt32() : 28800;
             var refreshExpiresIn = doc.RootElement.TryGetProperty("refresh_token_expires_in", out var rei) ? rei.GetInt32() : 15552000;
 
@@ -378,7 +563,7 @@ public sealed class TokenBroker(
 
     public async Task<DelegatedTokenStatus> GetConnectionStatusAsync(string gitHubLogin, CancellationToken ct = default)
     {
-        await using var db = await dbFactory.CreateDbContextAsync(ct);
+        await using var db = await _dbFactory.CreateDbContextAsync(ct);
         var record = await db.EncryptedUserTokens.FirstOrDefaultAsync(t => t.GitHubLogin == gitHubLogin, ct);
         if (record is null)
             return new DelegatedTokenStatus(gitHubLogin, false, false, null, null, true);
@@ -419,16 +604,15 @@ public sealed class TokenBroker(
 
     public async Task RevokeDelegatedTokenAsync(string gitHubLogin, CancellationToken ct = default)
     {
-        if (!envOptions.Value.SandboxMode
-            && !string.IsNullOrWhiteSpace(appOptions.Value.ClientSecret)
-            && _memoryCache.TryGetValue(gitHubLogin, out var cached))
+        TryLoadPersistedOAuthConfig();
+        if (IsGitHubOAuthConfigured && _memoryCache.TryGetValue(gitHubLogin, out var cached))
         {
-            using var http = httpClientFactory.CreateClient("GitHubOAuth");
-            using var req = new HttpRequestMessage(HttpMethod.Delete, $"https://api.github.com/applications/{appOptions.Value.ClientId}/token")
+            using var http = _httpClientFactory.CreateClient("GitHubOAuth");
+            using var req = new HttpRequestMessage(HttpMethod.Delete, $"https://api.github.com/applications/{_appOptions.ClientId}/token")
             {
                 Content = JsonContent.Create(new { access_token = cached.AccessToken })
             };
-            var basic = Convert.ToBase64String(Encoding.UTF8.GetBytes($"{appOptions.Value.ClientId}:{appOptions.Value.ClientSecret}"));
+            var basic = Convert.ToBase64String(Encoding.UTF8.GetBytes($"{_appOptions.ClientId}:{_appOptions.ClientSecret}"));
             req.Headers.Authorization = new AuthenticationHeaderValue("Basic", basic);
             req.Headers.UserAgent.ParseAdd("Demo-Factory/0.8");
             await http.SendAsync(req, ct);
@@ -446,12 +630,12 @@ public sealed class TokenBroker(
         CancellationToken ct)
     {
         // §10.1: Store the new encrypted refresh token BEFORE dropping the old access token in memory
-        var encrypted = await protector.EncryptRefreshTokenAsync(refreshToken, ct);
+        var encrypted = await _protector.EncryptRefreshTokenAsync(refreshToken, ct);
         var now = DateTimeOffset.UtcNow;
         var accessExpires = now.Add(accessLifetime);
         var refreshExpires = now.Add(refreshLifetime);
 
-        await using var db = await dbFactory.CreateDbContextAsync(ct);
+        await using var db = await _dbFactory.CreateDbContextAsync(ct);
         var entity = await db.EncryptedUserTokens.FirstOrDefaultAsync(t => t.GitHubLogin == gitHubLogin, ct);
         if (entity is null)
         {
@@ -459,7 +643,7 @@ public sealed class TokenBroker(
             {
                 GitHubLogin = gitHubLogin,
                 EncryptedRefreshToken = encrypted,
-                KeyId = string.IsNullOrWhiteSpace(appOptions.Value.KeyVaultWrapKeyId) ? "local-aes-gcm" : appOptions.Value.KeyVaultWrapKeyId,
+                KeyId = string.IsNullOrWhiteSpace(_appOptions.KeyVaultWrapKeyId) ? "local-aes-gcm" : _appOptions.KeyVaultWrapKeyId,
                 AccessTokenExpiresAt = accessExpires,
                 RefreshTokenExpiresAt = refreshExpires,
                 IsRevoked = false,
@@ -482,9 +666,9 @@ public sealed class TokenBroker(
     private async Task HandleRevocationOrRefreshFailureInternalAsync(string gitHubLogin, string reason, CancellationToken ct)
     {
         _memoryCache.TryRemove(gitHubLogin, out _);
-        logger.LogWarning("Delegated GitHub token unavailable for {Login}: {Reason}. Pausing all projects.", gitHubLogin, reason);
+        _logger.LogWarning("Delegated GitHub token unavailable for {Login}: {Reason}. Pausing all projects.", gitHubLogin, reason);
 
-        await using var db = await dbFactory.CreateDbContextAsync(ct);
+        await using var db = await _dbFactory.CreateDbContextAsync(ct);
         var token = await db.EncryptedUserTokens.FirstOrDefaultAsync(t => t.GitHubLogin == gitHubLogin, ct);
         if (token is not null)
         {
@@ -514,7 +698,7 @@ public sealed class TokenBroker(
         }
 
         await db.SaveChangesAsync(ct);
-        await auditLogger.RecordAsync(
+        await _auditLogger.RecordAsync(
             gitHubLogin,
             "FactoryPausedReconnectRequired",
             "TokenBroker",

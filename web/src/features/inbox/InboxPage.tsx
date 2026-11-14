@@ -62,7 +62,7 @@ export const InboxPage: React.FC<{ projectId?: string }> = ({ projectId }) => {
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 12 }}>
         <div>
           <Text size={600} weight="bold" block>
-            Issue Inbox — Unmanaged & Community Input (§5.6)
+            Issue Inbox — Unmanaged &amp; Community Input
           </Text>
           <Text size={200} style={{ color: tokens.colorNeutralForeground3 }}>
             Issues without a trusted work label are never assigned directly to Copilot. Select items to synthesize a vetted feature spec.
@@ -88,7 +88,7 @@ export const InboxPage: React.FC<{ projectId?: string }> = ({ projectId }) => {
           <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
             <Warning20Filled />
             <Text weight="semibold">
-              Security boundary (§5.6): Issues opened by outside users cannot be built directly even if you add the work
+              Security boundary: Issues opened by outside users cannot be built directly even if you add the work
               label, because the original author could edit the text afterwards. Use &ldquo;Create Feature from Selected&rdquo; instead.
             </Text>
           </div>

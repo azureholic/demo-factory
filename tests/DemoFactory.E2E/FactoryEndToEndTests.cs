@@ -31,9 +31,11 @@ public sealed class FactoryEndToEndTests : IAsyncLifetime
                 {
                     ["ConnectionStrings:Sqlite"] = $"Data Source={_dbFile}",
                     ["Factory:SandboxMode"] = "true",
+                    ["Factory:AllowTestHeaderAuth"] = "true",
                     ["Factory:SeedDemoData"] = "true",
                     ["Factory:OwnerLogin"] = "azureholic",
                     ["Factory:PoliciesDirectory"] = _policiesDir,
+                    ["Factory:LocalDataDirectory"] = _policiesDir,
                     ["GitHub:WebhookSecret"] = WebhookSecret
                 });
             });
@@ -281,6 +283,84 @@ public sealed class FactoryEndToEndTests : IAsyncLifetime
         var status = await _client.GetFromJsonAsync<JsonElement>("/api/factory/status");
         Assert.Equal("Paused", status.GetProperty("status").GetString());
         Assert.True(status.GetProperty("reconnectRequired").GetBoolean());
+    }
+
+    [Fact]
+    public async Task EndToEnd_Login_Session_Cookie_GitHub_Redirect_And_Logout()
+    {
+        var isolatedDb = Path.Combine(Path.GetTempPath(), $"demofactory-auth-e2e-{Guid.NewGuid():N}.db");
+        var isolatedDir = Path.Combine(Path.GetTempPath(), $"demofactory-auth-dir-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(isolatedDir);
+
+        try
+        {
+            using var browserFactory = new WebApplicationFactory<ApiAssemblyMarker>().WithWebHostBuilder(b =>
+            {
+                b.ConfigureAppConfiguration((_, cfg) =>
+                {
+                    cfg.AddInMemoryCollection(new Dictionary<string, string?>
+                    {
+                        ["ConnectionStrings:Sqlite"] = $"Data Source={isolatedDb}",
+                        ["Factory:SandboxMode"] = "true",
+                        ["Factory:AllowTestHeaderAuth"] = "false",
+                        ["Factory:LocalDataDirectory"] = isolatedDir,
+                        ["Factory:PoliciesDirectory"] = isolatedDir
+                    });
+                });
+            });
+
+            using var browserClient = browserFactory.CreateClient(new WebApplicationFactoryClientOptions
+            {
+                AllowAutoRedirect = false,
+                HandleCookies = true
+            });
+
+            // 1. Unauthenticated /auth/me returns 401; /auth/github/manifest-start emits a valid GitHub App manifest
+            var unauthMe = await browserClient.GetAsync("/auth/me");
+            Assert.Equal(HttpStatusCode.Unauthorized, unauthMe.StatusCode);
+
+            var manifestHtmlResp = await browserClient.GetAsync("/auth/github/manifest-start");
+            Assert.Equal(HttpStatusCode.OK, manifestHtmlResp.StatusCode);
+            var manifestJson = AuthEndpoints.BuildGitHubAppManifestJson("http://localhost:5173");
+            using var manifestDoc = JsonDocument.Parse(manifestJson);
+            var mRoot = manifestDoc.RootElement;
+            Assert.Equal("https://example.com/webhooks/github", mRoot.GetProperty("hook_attributes").GetProperty("url").GetString());
+            Assert.False(mRoot.GetProperty("hook_attributes").GetProperty("active").GetBoolean());
+            Assert.Equal("read", mRoot.GetProperty("default_permissions").GetProperty("vulnerability_alerts").GetString());
+            Assert.False(mRoot.GetProperty("default_permissions").TryGetProperty("dependabot_alerts", out _));
+
+            // 2. Sign in via cookie session (/auth/sandbox/login) -> /auth/me returns 200
+            var loginResp = await browserClient.PostAsJsonAsync("/auth/sandbox/login", new { login = "remcobrosky", role = "Admin" });
+            Assert.Equal(HttpStatusCode.OK, loginResp.StatusCode);
+
+            var authedMe = await browserClient.GetFromJsonAsync<JsonElement>("/auth/me");
+            Assert.Equal("remcobrosky", authedMe.GetProperty("login").GetString());
+            Assert.Equal("Admin", authedMe.GetProperty("role").GetString());
+
+            // 3. Configuring GitHub OAuth credentials enables real 302 redirect to github.com/login/oauth/authorize
+            var saveCfg = await browserClient.PostAsJsonAsync("/auth/config/github", new
+            {
+                clientId = "Iv23liRealGitHubAppTest",
+                clientSecret = "secret_test_value_12345"
+            });
+            Assert.Equal(HttpStatusCode.OK, saveCfg.StatusCode);
+
+            var ghLoginRedirect = await browserClient.GetAsync("/auth/github/login");
+            Assert.Equal(HttpStatusCode.Redirect, ghLoginRedirect.StatusCode);
+            Assert.StartsWith("https://github.com/login/oauth/authorize?client_id=Iv23liRealGitHubAppTest", ghLoginRedirect.Headers.Location?.ToString());
+
+            // 4. Logout clears df_session cookie -> /auth/me returns 401 again
+            var logoutResp = await browserClient.PostAsync("/auth/logout", null);
+            Assert.Equal(HttpStatusCode.OK, logoutResp.StatusCode);
+
+            var afterLogoutMe = await browserClient.GetAsync("/auth/me");
+            Assert.Equal(HttpStatusCode.Unauthorized, afterLogoutMe.StatusCode);
+        }
+        finally
+        {
+            if (File.Exists(isolatedDb)) { try { File.Delete(isolatedDb); } catch { } }
+            if (Directory.Exists(isolatedDir)) { try { Directory.Delete(isolatedDir, recursive: true); } catch { } }
+        }
     }
 
     private Task<HttpResponseMessage> SendSignedWebhookAsync(string eventType, string deliveryId, string jsonBody)

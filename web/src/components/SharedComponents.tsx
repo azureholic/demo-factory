@@ -226,7 +226,7 @@ export const AndonBanner: React.FC<{ stoppedRepos: RepoSummary[]; reconnectRequi
           <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
             <ErrorCircle20Filled style={{ color: tokens.colorPaletteRedForeground1 }} />
             <Text weight="semibold">
-              Reconnect GitHub: Your delegated user token expired or was revoked. All projects are paused (§10.1).
+              Reconnect GitHub: Your delegated user token expired or was revoked. All projects are paused.
             </Text>
           </div>
           <Button appearance="primary" as="a" href="/auth/github/login">
@@ -239,7 +239,7 @@ export const AndonBanner: React.FC<{ stoppedRepos: RepoSummary[]; reconnectRequi
           <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
             <ErrorCircle20Filled style={{ color: tokens.colorPaletteRedForeground1 }} />
             <Text weight="semibold">
-              STOP THE LINE — {r.fullName}: {r.lineCause ?? 'Main workflow failed'}. Only revert / line-fix PRs may merge (§6.2).
+              STOP THE LINE — {r.fullName}: {r.lineCause ?? 'Main workflow failed'}. Only revert and line-fix PRs may merge.
             </Text>
           </div>
           <Button
