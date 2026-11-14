@@ -620,6 +620,32 @@ public sealed class FactoryOrchestrationCoordinator(
             .Select(w => w.IssueNumber)
             .ToHashSet();
 
+        // Automatically promote planned Queued Backlog items to Ready once all their blockedBy prerequisites have merged,
+        // unless an operator explicitly parked the card in Backlog ("OperatorHeldInBacklog").
+        var autoPromoted = false;
+        var now = DateTimeOffset.UtcNow;
+        foreach (var w in allWorkItems)
+        {
+            if (w.State == WorkItemStateKind.Queued
+                && w.BoardStatus == BoardStatus.Backlog
+                && w.PassesWorkLabelRule
+                && !string.Equals(w.BlockedReason, "OperatorHeldInBacklog", StringComparison.Ordinal))
+            {
+                var blockerNums = SafeDeserializeList<int>(w.BlockedByIssueNumbersJson);
+                if (blockerNums.All(b => !openIssues.Contains(b)))
+                {
+                    w.BoardStatus = BoardStatus.Ready;
+                    w.ReadyAt ??= now;
+                    w.UpdatedAt = now;
+                    autoPromoted = true;
+                }
+            }
+        }
+        if (autoPromoted)
+        {
+            await db.SaveChangesAsync(ct);
+        }
+
         var inFlightStates = new HashSet<WorkItemStateKind>
         {
             WorkItemStateKind.Claimed,
@@ -1441,6 +1467,41 @@ public sealed class FactoryOrchestrationCoordinator(
                         .Where(w => w.RepoId == repo.Id && activeStates.Contains(w.State))
                         .OrderBy(w => w.IssueNumber)
                         .ToListAsync(ct);
+
+                    var repoSettingsForWip = await db.RuntimeSettings.FirstOrDefaultAsync(s => s.Scope == SettingsScope.Repo && s.TargetId == repo.Id, ct);
+                    var wip = repoSettingsForWip?.Wip ?? global?.Wip ?? policy.Wip;
+                    var lineState = await db.LineStates.FirstOrDefaultAsync(l => l.RepoId == repo.Id, ct);
+
+                    // Watch for available WIP slots and automatically promote/dispatch newly unblocked Queued items
+                    if (activeItems.Count < wip && lineState?.State != LineStatus.LineStopped)
+                    {
+                        var allRepoItems = await db.WorkItems
+                            .Where(w => w.RepoId == repo.Id)
+                            .ToListAsync(ct);
+                        var openNums = allRepoItems
+                            .Where(w => w.BoardStatus != BoardStatus.Done && w.State != WorkItemStateKind.Merged && w.State != WorkItemStateKind.Cancelled)
+                            .Select(w => w.IssueNumber)
+                            .ToHashSet();
+
+                        var hasUnblockedQueued = allRepoItems.Any(w =>
+                            w.State == WorkItemStateKind.Queued
+                            && w.PassesWorkLabelRule
+                            && !string.Equals(w.BlockedReason, "OperatorHeldInBacklog", StringComparison.Ordinal)
+                            && SafeDeserializeList<int>(w.BlockedByIssueNumbersJson).All(b => !openNums.Contains(b)));
+
+                        if (hasUnblockedQueued)
+                        {
+                            var newlyStarted = await SelectAndStartScheduledItemsActivityAsync(repo.Id, ct);
+                            if (newlyStarted.Count > 0)
+                            {
+                                progressed += newlyStarted.Count;
+                                activeItems = await db.WorkItems
+                                    .Where(w => w.RepoId == repo.Id && activeStates.Contains(w.State))
+                                    .OrderBy(w => w.IssueNumber)
+                                    .ToListAsync(ct);
+                            }
+                        }
+                    }
 
                     if (activeItems.Count == 0 && !workflowsBackfilled)
                     {

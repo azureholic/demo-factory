@@ -772,6 +772,7 @@ public sealed class FactoryEndToEndTests : IAsyncLifetime
             var dbFactory = reconcileFactory.Services.GetRequiredService<IDbContextFactory<DemoFactoryDbContext>>();
             Guid repoId;
             Guid wi1Id;
+            Guid wi2Id;
             await using (var db = await dbFactory.CreateDbContextAsync())
             {
                 var proj = new ProjectEntity { Name = "Browser Beatbox", Slug = "browser-beatbox-628", SpecMarkdown = "# Beatbox", TemplateId = "dotnet-react", IsPublic = true };
@@ -785,7 +786,7 @@ public sealed class FactoryEndToEndTests : IAsyncLifetime
                     RepoId = repo.Id,
                     IssueNumber = 1,
                     Title = "Walking skeleton",
-                    BodyMarkdown = "Scaffold app",
+                    BodyMarkdown = "Scaffold the .NET 11 + React walking skeleton and health probe.",
                     AcceptanceCriteriaJson = "[\"Healthz returns 200\"]",
                     LabelsJson = "[\"factory\"]",
                     IssueAuthor = "azureholic",
@@ -795,15 +796,36 @@ public sealed class FactoryEndToEndTests : IAsyncLifetime
                     State = WorkItemStateKind.Implementing,
                     BoardStatus = BoardStatus.InProgress
                 };
-                db.WorkItems.Add(wi1);
+
+                // Downstream item #2 starts in Backlog blocked by #1 -> orchestrator must auto-promote & dispatch once #1 merges!
+                var wi2 = new WorkItemEntity
+                {
+                    RepoId = repo.Id,
+                    IssueNumber = 2,
+                    Title = "Acceptance Test: 16-step continuous looping sequencer",
+                    BodyMarkdown = "Add executable acceptance tests verifying 16-step loop progression.",
+                    AcceptanceCriteriaJson = "[\"Sequencer advances through all 16 steps\"]",
+                    BlockedByIssueNumbersJson = "[1]",
+                    LabelsJson = "[\"factory\",\"acceptance-test\"]",
+                    IssueAuthor = "azureholic",
+                    WorkLabelAppliedBy = "azureholic",
+                    PassesWorkLabelRule = true,
+                    IsAcceptanceTestIssue = true,
+                    GateProfile = GateProfile.AcceptanceTest,
+                    State = WorkItemStateKind.Queued,
+                    BoardStatus = BoardStatus.Backlog
+                };
+
+                db.WorkItems.AddRange(wi1, wi2);
                 await db.SaveChangesAsync();
                 repoId = repo.Id;
                 wi1Id = wi1.Id;
+                wi2Id = wi2.Id;
             }
 
             var coordinator = reconcileFactory.Services.GetRequiredService<IFactoryOrchestrationCoordinator>();
 
-            // Tick 1: Detects copilot_work_finished on Draft PR #10 -> marks Ready for Review via GraphQL & transitions #1 to Validating
+            // Tick 1: Detects copilot_work_finished on Draft PR #10 -> marks Ready for Review via GraphQL & transitions #1 to Validating (#2 stays in Backlog while #1 is open)
             var p1 = await coordinator.ReconcileActiveWorkItemsOnceAsync(repoId);
             Assert.True(p1 > 0);
             Assert.True(markedReadyViaGraphQl);
@@ -811,20 +833,25 @@ public sealed class FactoryEndToEndTests : IAsyncLifetime
             await using (var db = await dbFactory.CreateDbContextAsync())
             {
                 var wi = await db.WorkItems.FirstAsync(w => w.Id == wi1Id);
+                var wi2 = await db.WorkItems.FirstAsync(w => w.Id == wi2Id);
                 Assert.Equal(WorkItemStateKind.Validating, wi.State);
                 Assert.Equal(10, wi.PrNumber);
+                Assert.Equal(BoardStatus.Backlog, wi2.BoardStatus);
             }
 
-            // Tick 2: Evaluates green CI + Copilot review (ignoring package-lock.json line bloat) -> passes 15-condition gate & squash-merges PR #10 -> Merged/Done!
+            // Tick 2: Evaluates green CI + Copilot review -> squash-merges PR #10 -> marks #1 Merged/Done AND automatically promotes & dispatches #2 from Backlog -> InProgress/Implementing!
             var p2 = await coordinator.ReconcileActiveWorkItemsOnceAsync(repoId);
             Assert.True(p2 > 0);
             Assert.True(squashMergedViaRest);
 
             await using (var db = await dbFactory.CreateDbContextAsync())
             {
-                var wi = await db.WorkItems.FirstAsync(w => w.Id == wi1Id);
-                Assert.Equal(WorkItemStateKind.Merged, wi.State);
-                Assert.Equal(BoardStatus.Done, wi.BoardStatus);
+                var wi1 = await db.WorkItems.FirstAsync(w => w.Id == wi1Id);
+                var wi2 = await db.WorkItems.FirstAsync(w => w.Id == wi2Id);
+                Assert.Equal(WorkItemStateKind.Merged, wi1.State);
+                Assert.Equal(BoardStatus.Done, wi1.BoardStatus);
+                Assert.Equal(WorkItemStateKind.Implementing, wi2.State);
+                Assert.Equal(BoardStatus.InProgress, wi2.BoardStatus);
             }
         }
         finally

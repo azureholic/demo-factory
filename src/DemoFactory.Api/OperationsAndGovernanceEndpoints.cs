@@ -692,6 +692,7 @@ public static class OperationsAndGovernanceEndpoints
                 case "mark-ready":
                     wi.State = WorkItemStateKind.Queued;
                     wi.BoardStatus = BoardStatus.Ready;
+                    wi.BlockedReason = null;
                     wi.ReadyAt = DateTimeOffset.UtcNow;
                     wi.UpdatedAt = DateTimeOffset.UtcNow;
                     await db.SaveChangesAsync(ct);
@@ -818,7 +819,12 @@ public static class OperationsAndGovernanceEndpoints
                     if (moveReq.ToStatus == BoardStatus.Ready)
                     {
                         wi.State = WorkItemStateKind.Queued;
+                        wi.BlockedReason = null;
                         wi.ReadyAt ??= DateTimeOffset.UtcNow;
+                    }
+                    else if (moveReq.ToStatus == BoardStatus.Backlog)
+                    {
+                        wi.BlockedReason = "OperatorHeldInBacklog";
                     }
                     else if (moveReq.ToStatus == BoardStatus.Blocked)
                     {
