@@ -121,10 +121,10 @@ export const PoliciesPage: React.FC<{ repoId?: string }> = ({ repoId }) => {
 
           <div>
             <Text size={200} weight="semibold" block>
-              Project Manager Agent Deployment (Microsoft Foundry — EU Region)
+              Orchestrator / Project Manager Model Deployment (Microsoft Foundry — MAI-Thinking)
             </Text>
             <Input
-              defaultValue={globalSettings.pmModelDeployment ?? 'gpt-4.1-eu'}
+              defaultValue={globalSettings.pmModelDeployment ?? 'orchestrator-model'}
               onBlur={e => saveGlobalMutation.mutate({ pmModelDeployment: e.target.value })}
             />
           </div>

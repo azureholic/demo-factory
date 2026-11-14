@@ -23,9 +23,9 @@ public sealed class FactoryEnvironmentOptions
     public string EvidenceBlobServiceUri { get; set; } = string.Empty;
     public string EvidenceLocalDirectory { get; set; } = "artifacts/evidence";
     public string ServiceBusFullyQualifiedNamespace { get; set; } = string.Empty;
-    public string ServiceBusQueueName { get; set; } = "github-webhooks";
+    public string ServiceBusQueueName { get; set; } = "sbq-github-webhooks";
     public string PreviewsSubscriptionId { get; set; } = string.Empty;
-    public string PreviewsResourceGroup { get; set; } = "rg-demo-factory-previews";
+    public string PreviewsResourceGroup { get; set; } = "rg-demofactory-previews-swc-001";
     public string ManagedIdentityClientId { get; set; } = string.Empty;
     public string LocalDataDirectory { get; set; } = string.Empty;
     public string TemplatesDirectory { get; set; } = "templates";

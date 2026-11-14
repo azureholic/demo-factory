@@ -11,7 +11,7 @@ intake:
   closeSourceIssuesWhenDone: true
 models:
   coding: gemini-4-carbon
-  pm: foundry/gpt-4.1-eu
+  pm: foundry/orchestrator-model
 review:
   blockingSeverity: Medium
   maxRounds: 3

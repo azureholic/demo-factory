@@ -94,7 +94,7 @@ public sealed class IntakePolicy
 public sealed class PolicyModels
 {
     public string Coding { get; set; } = "gemini-4-carbon";
-    public string Pm { get; set; } = "foundry/gpt-4.1";
+    public string Pm { get; set; } = "foundry/orchestrator-model";
 }
 
 public sealed class ReviewPolicy

@@ -21,4 +21,4 @@ jobs:
           tenant-id: ${{ vars.AZURE_TENANT_ID }}
           subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
       - name: Deploy stable demo Container App (synthetic seed only, zero secrets)
-        run: echo "Deploying demo-${{ github.event.repository.name }} from main@${{ github.sha }}"
+        run: echo "Deploying ca-demo-${{ github.event.repository.name }} from main@${{ github.sha }}"

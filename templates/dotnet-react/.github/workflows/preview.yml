@@ -50,7 +50,7 @@ jobs:
           subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
       - id: deploy_aca
         run: |
-          APP_NAME="pr-${{ steps.meta.outputs.pr_number }}-${{ github.event.repository.name }}"
+          APP_NAME="ca-pr-${{ steps.meta.outputs.pr_number }}-${{ github.event.repository.name }}"
           echo "url=https://${APP_NAME}.${{ vars.AZURE_PREVIEW_DOMAIN }}" >> "$GITHUB_OUTPUT"
 
   acceptance:

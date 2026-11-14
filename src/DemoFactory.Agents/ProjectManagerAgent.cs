@@ -1,3 +1,5 @@
+using System.Net.Http.Headers;
+using System.Net.Http.Json;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
@@ -18,7 +20,7 @@ namespace DemoFactory.Agents;
 public sealed class FoundryAgentOptions
 {
     public string ProjectEndpoint { get; set; } = string.Empty;
-    public string DefaultDeployment { get; set; } = "gpt-4.1-eu";
+    public string DefaultDeployment { get; set; } = "orchestrator-model";
     public string Region { get; set; } = "swedencentral";
     public string PromptsDirectory { get; set; } = "agents/pm";
     public string PromptVersion { get; set; } = "v1.0";
@@ -55,21 +57,24 @@ public interface IProjectManagerModelTransport
 /// </summary>
 public sealed class FoundryAgentFrameworkTransport(IOptions<FoundryAgentOptions> options) : IProjectManagerModelTransport
 {
+    private static readonly HttpClient SharedHttp = new() { Timeout = TimeSpan.FromMinutes(3) };
+
     public bool IsConfigured =>
         !string.IsNullOrWhiteSpace(options.Value.ProjectEndpoint)
         && Uri.TryCreate(options.Value.ProjectEndpoint, UriKind.Absolute, out _);
 
-    public AIAgent CreateFoundryAgent(string? deploymentOverride = null, string? instructionsOverride = null)
-    {
-        var endpoint = string.IsNullOrWhiteSpace(options.Value.ProjectEndpoint)
-            ? "https://demo-factory-foundry.services.ai.azure.com/api/projects/demo-factory-eu"
-            : options.Value.ProjectEndpoint;
-
-        TokenCredential credential = string.IsNullOrWhiteSpace(options.Value.ManagedIdentityClientId)
+    private TokenCredential CreateCredential() =>
+        string.IsNullOrWhiteSpace(options.Value.ManagedIdentityClientId)
             ? new DefaultAzureCredential()
             : new ManagedIdentityCredential(ManagedIdentityId.FromUserAssignedClientId(options.Value.ManagedIdentityClientId));
 
-        var projectClient = new AIProjectClient(new Uri(endpoint), credential);
+    public AIAgent CreateFoundryAgent(string? deploymentOverride = null, string? instructionsOverride = null)
+    {
+        var endpoint = string.IsNullOrWhiteSpace(options.Value.ProjectEndpoint)
+            ? "https://aif-demofactory-dev-swc.services.ai.azure.com/api/projects/proj-demofactory-dev-swc"
+            : options.Value.ProjectEndpoint;
+
+        var projectClient = new AIProjectClient(new Uri(endpoint), CreateCredential());
         var model = string.IsNullOrWhiteSpace(deploymentOverride) ? options.Value.DefaultDeployment : deploymentOverride;
         var instructions = instructionsOverride ?? LoadSystemInstructions(options.Value.PromptsDirectory);
 
@@ -88,9 +93,88 @@ public sealed class FoundryAgentFrameworkTransport(IOptions<FoundryAgentOptions>
         if (!IsConfigured)
             throw new InvalidOperationException("Foundry ProjectEndpoint is not configured; using deterministic PM fallback.");
 
-        var agent = CreateFoundryAgent(deploymentName, systemInstructions);
-        var response = await agent.RunAsync(userPrompt, cancellationToken: ct);
-        return response.Text ?? string.Empty;
+        var normalizedModel = deploymentName.StartsWith("foundry/", StringComparison.OrdinalIgnoreCase)
+            ? deploymentName["foundry/".Length..]
+            : deploymentName;
+
+        try
+        {
+            var agent = CreateFoundryAgent(normalizedModel, systemInstructions);
+            var response = await agent.RunAsync(userPrompt, cancellationToken: ct);
+            if (!string.IsNullOrWhiteSpace(response.Text))
+                return response.Text;
+        }
+        catch (Exception) when (!ct.IsCancellationRequested)
+        {
+            // Unified MaaS reasoning models (such as MAI-Thinking-1 / orchestrator-model with disable-maap=true)
+            // serve inference over Microsoft Foundry's Unified Chat Completions endpoint.
+        }
+
+        return await InvokeFoundryUnifiedChatCompletionsAsync(systemInstructions, userPrompt, normalizedModel, ct);
+    }
+
+    private async Task<string> InvokeFoundryUnifiedChatCompletionsAsync(
+        string systemInstructions,
+        string userPrompt,
+        string deploymentName,
+        CancellationToken ct)
+    {
+        var projectUri = new Uri(options.Value.ProjectEndpoint);
+        var baseAuthority = $"{projectUri.Scheme}://{projectUri.Host}";
+        var token = await CreateCredential().GetTokenAsync(
+            new TokenRequestContext(["https://cognitiveservices.azure.com/.default"]),
+            ct);
+
+        var candidateUrls = new[]
+        {
+            $"{baseAuthority}/models/chat/completions?api-version=2024-05-01-preview",
+            $"{baseAuthority}/openai/deployments/{Uri.EscapeDataString(deploymentName)}/chat/completions?api-version=2025-01-01-preview"
+        };
+
+        Exception? lastErr = null;
+        foreach (var url in candidateUrls)
+        {
+            try
+            {
+                using var req = new HttpRequestMessage(HttpMethod.Post, url)
+                {
+                    Content = JsonContent.Create(new
+                    {
+                        model = deploymentName,
+                        messages = new object[]
+                        {
+                            new { role = "system", content = systemInstructions },
+                            new { role = "user", content = userPrompt }
+                        },
+                        max_completion_tokens = 8192
+                    })
+                };
+                req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token.Token);
+
+                using var resp = await SharedHttp.SendAsync(req, ct);
+                if (!resp.IsSuccessStatusCode)
+                {
+                    var bodyErr = await resp.Content.ReadAsStringAsync(ct);
+                    lastErr = new HttpRequestException($"Foundry chat completion {url} returned HTTP {(int)resp.StatusCode}: {bodyErr}");
+                    continue;
+                }
+
+                using var doc = await JsonDocument.ParseAsync(await resp.Content.ReadAsStreamAsync(ct), cancellationToken: ct);
+                var choices = doc.RootElement.GetProperty("choices");
+                if (choices.GetArrayLength() > 0 &&
+                    choices[0].TryGetProperty("message", out var msg) &&
+                    msg.TryGetProperty("content", out var contentProp))
+                {
+                    return contentProp.GetString() ?? string.Empty;
+                }
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                lastErr = ex;
+            }
+        }
+
+        throw lastErr ?? new InvalidOperationException($"Unable to invoke Foundry deployment '{deploymentName}'.");
     }
 
     public static string LoadSystemInstructions(string promptsDir)
@@ -704,15 +788,29 @@ public sealed partial class ProjectManagerAgent(
     private static string StripCodeFences(string raw)
     {
         var trimmed = raw.Trim();
-        if (!trimmed.StartsWith("```", StringComparison.Ordinal))
-            return trimmed;
 
-        var firstNewLine = trimmed.IndexOf('\n');
-        if (firstNewLine > 0)
-            trimmed = trimmed[(firstNewLine + 1)..];
-        if (trimmed.EndsWith("```", StringComparison.Ordinal))
-            trimmed = trimmed[..^3];
-        return trimmed.Trim();
+        // Strip internal chain-of-thought (<think>...</think>) emitted by reasoning models such as MAI-Thinking-1
+        var thinkEnd = trimmed.LastIndexOf("</think>", StringComparison.OrdinalIgnoreCase);
+        if (thinkEnd >= 0)
+            trimmed = trimmed[(thinkEnd + "</think>".Length)..].Trim();
+
+        if (trimmed.StartsWith("```", StringComparison.Ordinal))
+        {
+            var firstNewLine = trimmed.IndexOf('\n');
+            if (firstNewLine > 0)
+                trimmed = trimmed[(firstNewLine + 1)..];
+            if (trimmed.EndsWith("```", StringComparison.Ordinal))
+                trimmed = trimmed[..^3];
+            trimmed = trimmed.Trim();
+        }
+
+        // If reasoning prose precedes or trails the JSON object, isolate the outermost JSON object
+        var firstBrace = trimmed.IndexOf('{');
+        var lastBrace = trimmed.LastIndexOf('}');
+        if (firstBrace >= 0 && lastBrace > firstBrace)
+            return trimmed[firstBrace..(lastBrace + 1)];
+
+        return trimmed;
     }
 
     private static string FormatUntrustedIssuesBlock(IReadOnlyList<UntrustedInboxIssue> issues)

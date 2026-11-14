@@ -818,7 +818,7 @@ public sealed class FactoryOrchestrationCoordinator(
         // Step 9b & 10: Azure OIDC wiring + readiness smoke test
         var readiness = await gitHub.EvaluateRepositoryReadinessAsync(owner, repoName, ct);
         repo.ReadinessReportJson = JsonSerializer.Serialize(readiness, JsonOpts);
-        project.DemoUrl = $"https://demo-{repoName}.swedencentral.azurecontainerapps.io";
+        project.DemoUrl = $"https://ca-demo-{repoName}.swedencentral.azurecontainerapps.io";
         steps.Add(new BootstrapStepRecord(10, "Azure OIDC preview/demo wiring & readiness smoke test", "Completed"));
 
         // Step 11: Start ProjectScheduler (walking skeleton goes first)
@@ -1650,7 +1650,7 @@ public static class OrchestratorServiceCollectionExtensions
             // §3.2: Register Microsoft Agent Framework Durable Extension + Durable Task Scheduler in BYO-Compute mode
             var foundryEndpoint = configuration["Foundry:ProjectEndpoint"]
                 ?? "https://demo-factory-foundry.services.ai.azure.com/api/projects/demo-factory-eu";
-            var foundryDeployment = configuration["Foundry:DefaultDeployment"] ?? "gpt-4.1-eu";
+            var foundryDeployment = configuration["Foundry:DefaultDeployment"] ?? "orchestrator-model";
             var transport = new FoundryAgentFrameworkTransport(Options.Create(new FoundryAgentOptions
             {
                 ProjectEndpoint = foundryEndpoint,

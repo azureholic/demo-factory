@@ -8,6 +8,18 @@
     "location": {
       "value": "${AZURE_LOCATION=swedencentral}"
     },
+    "workloadName": {
+      "value": "${FACTORY_WORKLOAD_NAME=demofactory}"
+    },
+    "workloadShort": {
+      "value": "${FACTORY_WORKLOAD_SHORT=df}"
+    },
+    "environmentType": {
+      "value": "${FACTORY_ENVIRONMENT_TYPE=dev}"
+    },
+    "instanceNumber": {
+      "value": "${FACTORY_INSTANCE_NUMBER=001}"
+    },
     "deploymentProfile": {
       "value": "${FACTORY_DEPLOYMENT_PROFILE=lean}"
     },
@@ -28,6 +40,9 @@
     },
     "githubAppId": {
       "value": "${GITHUB_APP_ID=5758548}"
+    },
+    "vnetAddressPrefix": {
+      "value": "${FACTORY_VNET_PREFIX=10.200.0.0/16}"
     }
   }
 }

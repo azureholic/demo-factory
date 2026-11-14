@@ -8,7 +8,7 @@ infra:
   path: ./infra
 
 services:
-  factory-api:
+  web:
     project: ./src/DemoFactory.Api
     language: dotnet
     host: containerapp

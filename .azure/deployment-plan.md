@@ -1,6 +1,6 @@
 # Azure Deployment Plan
 
-> **Status:** Deployed
+> **Status:** Validated
 
 Generated: 2026-11-14T10:38:00+01:00
 Updated: 2026-11-14T15:25:00+01:00
@@ -25,7 +25,7 @@ Updated: 2026-11-14T15:25:00+01:00
 | **Tenant** | `Zava` (`6e689817-26c3-498a-a758-a45e53e81733`, `diax84977607.onmicrosoft.com`) |
 | **Subscription** | `zava-workload-2` (`05ad4d79-8611-4df8-9193-f96001436be9`) |
 | **Principal** | `admin@diax84977607.onmicrosoft.com` (`4a602d8d-68c1-45ba-b08a-4224e267f609`, Owner) |
-| **Location** | `swedencentral` (confirmed EU region for Microsoft Foundry `DataZoneStandard` `gpt-4.1-eu` & hosting) |
+| **Location** | `swedencentral` (`swc` — EU region hosting Microsoft Foundry `MAI-Thinking-1` as `orchestrator-model`) |
 
 ---
 
@@ -138,14 +138,22 @@ Updated: 2026-11-14T15:25:00+01:00
 
 ## 8. Deployment & Live Verification (`demofactory-swe1` / `swedencentral`)
 
-| Resource | Deployed Value |
-|----------|----------------|
-| Public UI & API Endpoint | `https://df-demofact-xfv37byc-vnet-api.calmmushroom-a064ad20.swedencentral.azurecontainerapps.io` |
-| Virtual Network (`10.200.0.0/16`) | `df-demofact-xfv37byc-vnet` (`snet-cae` `10.200.0.0/23`, `snet-pep` `10.200.2.0/24`) |
-| Private Endpoints | `df-demofact-xfv37byc-sql-pep` (`sqlServer`), `df-demofact-xfv37byc-kv-pep` (`vault`), `df-demofact-xfv37byc-blob-pep` (`blob`) |
-| Azure SQL Server (Private + Entra-only) | `df-demofact-xfv37byc-sql` (`publicNetworkAccess: Disabled`, Entra Admin: `df-demofact-xfv37byc-uami`) |
-| Durable Task Scheduler | `https://df-demofact-xfv-c9cfa5bd.swedencentral.durabletask.io` (`Sidecar work-item streaming connection established`) |
-| Microsoft Foundry Project (`gpt-4.1-eu`) | `https://df-demofact-xfv37byc-foundry.services.ai.azure.com/api/projects/demo-factory-eu` (`DataZoneStandard`) |
+| Resource Type | CAF/WAF Pattern | Resolved Name (`swedencentral` / `dev`) |
+|---------------|-----------------|-----------------------------------------|
+| Resource Group | `rg-<workload>-<env>-<region>-<###>` | `rg-demofactory-dev-swc-001` |
+| Web UI + BFF Container App (`web`) | `ca-<workload>-web-<env>-<region>` | `ca-demofactory-web-dev-swc` |
+| Orchestrator Container App (Reference) | `ca-<workload>-orch-<env>-<region>` | `ca-demofactory-orch-dev-swc` |
+| Container Apps Environment | `cae-<workload>-<env>-<region>` | `cae-demofactory-dev-swc` |
+| Virtual Network (`10.200.0.0/16`) | `vnet-<workload>-<env>-<region>-<###>` | `vnet-demofactory-dev-swc-001` (`snet-cae-demofactory-dev-swc-001` `10.200.0.0/23`, `snet-pep-demofactory-dev-swc-001` `10.200.2.0/24`) |
+| Private Endpoints + NICs | `pep-<svc>-<workload>-<env>-<region>-<###>` | `pep-sql-demofactory-dev-swc-001`, `pep-kv-demofactory-dev-swc-001`, `pep-st-demofactory-dev-swc-001` (`nic-pep-*`) |
+| Azure SQL Server & Database | `sql-<workload>-<env>-<region>-<token>` / `sqldb-*` | `sql-demofactory-dev-swc-<token>` / `sqldb-demofactory-dev` |
+| User-Assigned Managed Identity | `id-<workload>-<env>-<region>-<###>` | `id-demofactory-dev-swc-001` |
+| Key Vault | `kv-<short>-<env>-<region>-<token>` | `kv-df-dev-swc-<token>` |
+| Storage Account | `st<short><env><region><token>` | `stdfdevswc<token>` |
+| Container Registry | `cr<workload><env><region><token>` | `crdemofactorydevswc<token>` |
+| Durable Task Scheduler | `dts-<workload>-<env>-<region>-<token>` | `dts-demofactory-dev-swc-<token>` |
+| Microsoft Foundry & Model | `aif-<workload>-<env>-<region>-<token>` / `proj-*` | `aif-demofactory-dev-swc-<token>` / `proj-demofactory-dev-swc` / **`orchestrator-model` (`MAI-Thinking-1` `2026-06-01`, `GlobalStandard`)** |
+| Log Analytics & App Insights | `log-*` / `appi-*` | `log-demofactory-dev-swc-001` / `appi-demofactory-dev-swc-001` |
 
 ### Live Role Verification
 - Command: `az role assignment list --assignee-object-id 4eec2f7c-5e5b-4966-a544-db9bcc8ee790 --all -o table`

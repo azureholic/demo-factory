@@ -153,7 +153,7 @@ public static class DemoFactorySeeder
             {
                 Scope = SettingsScope.Global,
                 CodingModel = "gemini-4-carbon",
-                PmModelDeployment = "gpt-4.1-eu",
+                PmModelDeployment = "orchestrator-model",
                 Wip = 1,
                 Autonomy = AutonomyLevel.L1,
                 MaxRounds = 3,

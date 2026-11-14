@@ -251,6 +251,19 @@ public sealed class OrchestrationReplayAndAgentTests
         Assert.Equal(2, retryTransport.CallCount);
         Assert.Equal("Ready", res1.Verdict);
 
+        // MAI-Thinking-1 chain-of-thought (<think>...</think>) before JSON is stripped cleanly on first attempt
+        var thinkingTransport = new FlakyJsonModelTransport(
+            "<think>\nLet me analyze the acceptance criteria { internal braces } carefully.\n</think>\n```json\n{\"verdict\": \"Ready\", \"missing\": [], \"questions\": []}\n```");
+        var pmThink = new ProjectManagerAgent(
+            thinkingTransport,
+            new NullPmTraceSink(),
+            Options.Create(new FoundryAgentOptions()),
+            NullLogger<ProjectManagerAgent>.Instance);
+        Assert.Equal("orchestrator-model", new FoundryAgentOptions().DefaultDeployment);
+        var resThink = await pmThink.ReviewSpecAsync(new IssueSpecInput(3, "MAI Thinking Test", "Detailed spec", ["AC1"], ItemSize.Small, []));
+        Assert.Equal(1, thinkingTransport.CallCount);
+        Assert.Equal("Ready", resThink.Verdict);
+
         // Both attempts invalid -> deterministic fallback kicks in cleanly
         var brokenTransport = new FlakyJsonModelTransport("broken-1", """{"verdict": "INVALID_ENUM"}""");
         var pm2 = new ProjectManagerAgent(
