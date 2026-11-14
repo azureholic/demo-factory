@@ -140,20 +140,20 @@ Updated: 2026-11-14T15:25:00+01:00
 
 | Resource Type | CAF/WAF Pattern | Resolved Name (`swedencentral` / `dev`) |
 |---------------|-----------------|-----------------------------------------|
-| Resource Group | `rg-<workload>-<env>-<region>-<###>` | `rg-demofactory-dev-swc-001` |
+| Resource Group | `rg-<workload>-<env>-<region>` | `rg-demofactory-dev-swc` |
 | Web UI + BFF Container App (`web`) | `ca-<workload>-web-<env>-<region>` | `ca-demofactory-web-dev-swc` |
 | Orchestrator Container App (Reference) | `ca-<workload>-orch-<env>-<region>` | `ca-demofactory-orch-dev-swc` |
 | Container Apps Environment | `cae-<workload>-<env>-<region>` | `cae-demofactory-dev-swc` |
-| Virtual Network (`10.200.0.0/16`) | `vnet-<workload>-<env>-<region>-<###>` | `vnet-demofactory-dev-swc-001` (`snet-cae-demofactory-dev-swc-001` `10.200.0.0/23`, `snet-pep-demofactory-dev-swc-001` `10.200.2.0/24`) |
-| Private Endpoints + NICs | `pep-<svc>-<workload>-<env>-<region>-<###>` | `pep-sql-demofactory-dev-swc-001`, `pep-kv-demofactory-dev-swc-001`, `pep-st-demofactory-dev-swc-001` (`nic-pep-*`) |
+| Virtual Network (`10.200.0.0/16`) | `vnet-<workload>-<env>-<region>` | `vnet-demofactory-dev-swc` (`snet-cae-demofactory-dev-swc` `10.200.0.0/23`, `snet-pep-demofactory-dev-swc` `10.200.2.0/24`) |
+| Private Endpoints + NICs | `pep-<svc>-<workload>-<env>-<region>` | `pep-sql-demofactory-dev-swc`, `pep-kv-demofactory-dev-swc`, `pep-st-demofactory-dev-swc` (`nic-pep-*`) |
 | Azure SQL Server & Database | `sql-<workload>-<env>-<region>-<token>` / `sqldb-*` | `sql-demofactory-dev-swc-<token>` / `sqldb-demofactory-dev` |
-| User-Assigned Managed Identity | `id-<workload>-<env>-<region>-<###>` | `id-demofactory-dev-swc-001` |
+| User-Assigned Managed Identity | `id-<workload>-<env>-<region>` | `id-demofactory-dev-swc` |
 | Key Vault | `kv-<short>-<env>-<region>-<token>` | `kv-df-dev-swc-<token>` |
 | Storage Account | `st<short><env><region><token>` | `stdfdevswc<token>` |
 | Container Registry | `cr<workload><env><region><token>` | `crdemofactorydevswc<token>` |
 | Durable Task Scheduler | `dts-<workload>-<env>-<region>-<token>` | `dts-demofactory-dev-swc-<token>` |
 | Microsoft Foundry & Model | `aif-<workload>-<env>-<region>-<token>` / `proj-*` | `aif-demofactory-dev-swc-<token>` / `proj-demofactory-dev-swc` / **`orchestrator-model` (`MAI-Thinking-1` `2026-06-01`, `GlobalStandard`)** |
-| Log Analytics & App Insights | `log-*` / `appi-*` | `log-demofactory-dev-swc-001` / `appi-demofactory-dev-swc-001` |
+| Log Analytics & App Insights | `log-*` / `appi-*` | `log-demofactory-dev-swc` / `appi-demofactory-dev-swc` |
 
 ### Live Role Verification
 - Command: `az role assignment list --assignee-object-id 4eec2f7c-5e5b-4966-a544-db9bcc8ee790 --all -o table`

@@ -25,7 +25,7 @@ public sealed class FactoryEnvironmentOptions
     public string ServiceBusFullyQualifiedNamespace { get; set; } = string.Empty;
     public string ServiceBusQueueName { get; set; } = "sbq-github-webhooks";
     public string PreviewsSubscriptionId { get; set; } = string.Empty;
-    public string PreviewsResourceGroup { get; set; } = "rg-demofactory-previews-swc-001";
+    public string PreviewsResourceGroup { get; set; } = "rg-demofactory-previews-swc";
     public string ManagedIdentityClientId { get; set; } = string.Empty;
     public string LocalDataDirectory { get; set; } = string.Empty;
     public string TemplatesDirectory { get; set; } = "templates";

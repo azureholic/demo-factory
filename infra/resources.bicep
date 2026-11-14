@@ -24,9 +24,6 @@ param environmentType string = 'dev'
 @description('Abbreviated Azure region code (for example swc for swedencentral)')
 param regionShort string = 'swc'
 
-@description('Zero-padded instance number for resource-group-scoped resources')
-param instanceNumber string = '001'
-
 @allowed([
   'lean'
   'reference'
@@ -68,25 +65,25 @@ var isReference = deploymentProfile == 'reference'
 
 var caeSubnetPrefix = '10.200.0.0/23'
 var pepSubnetPrefix = '10.200.2.0/24'
-var caeSubnetName = 'snet-cae-${baseSegment}-${instanceNumber}'
-var pepSubnetName = 'snet-pep-${baseSegment}-${instanceNumber}'
+var caeSubnetName = 'snet-cae-${baseSegment}'
+var pepSubnetName = 'snet-pep-${baseSegment}'
 
-// CAF/WAF Resource Names (<resource-abbrev>-<workload>-<env>-<region>-<instance|token>)
-var managedIdentityName = 'id-${baseSegment}-${instanceNumber}'
-var vnetName = 'vnet-${baseSegment}-${instanceNumber}'
-var logAnalyticsName = 'log-${baseSegment}-${instanceNumber}'
-var appInsightsName = 'appi-${baseSegment}-${instanceNumber}'
+// CAF/WAF Resource Names (<resource-abbrev>-<workload>-<env>-<region>[-<token>])
+var managedIdentityName = 'id-${baseSegment}'
+var vnetName = 'vnet-${baseSegment}'
+var logAnalyticsName = 'log-${baseSegment}'
+var appInsightsName = 'appi-${baseSegment}'
 var containerRegistryName = take('cr${cleanWorkload}${cleanEnv}${regionShort}${uniqueToken}', 50)
 var keyVaultName = take('kv-${cleanShort}-${cleanEnv}-${regionShort}-${uniqueToken}', 24)
 var storageAccountName = take('st${cleanShort}${cleanEnv}${regionShort}${uniqueToken}', 24)
 var sqlServerName = 'sql-${baseSegment}-${uniqueToken}'
 var sqlDatabaseName = 'sqldb-${toLower(workloadName)}-${cleanEnv}'
-var sqlPepName = 'pep-sql-${baseSegment}-${instanceNumber}'
-var sqlPepNicName = 'nic-pep-sql-${baseSegment}-${instanceNumber}'
-var kvPepName = 'pep-kv-${baseSegment}-${instanceNumber}'
-var kvPepNicName = 'nic-pep-kv-${baseSegment}-${instanceNumber}'
-var stPepName = 'pep-st-${baseSegment}-${instanceNumber}'
-var stPepNicName = 'nic-pep-st-${baseSegment}-${instanceNumber}'
+var sqlPepName = 'pep-sql-${baseSegment}'
+var sqlPepNicName = 'nic-pep-sql-${baseSegment}'
+var kvPepName = 'pep-kv-${baseSegment}'
+var kvPepNicName = 'nic-pep-kv-${baseSegment}'
+var stPepName = 'pep-st-${baseSegment}'
+var stPepNicName = 'nic-pep-st-${baseSegment}'
 var dtsName = 'dts-${baseSegment}-${uniqueToken}'
 var foundryAccountName = 'aif-${baseSegment}-${uniqueToken}'
 var foundryProjectName = 'proj-${baseSegment}'

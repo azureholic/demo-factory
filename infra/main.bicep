@@ -21,9 +21,6 @@ param workloadShort string = 'df'
 @description('Lifecycle environment segment in CAF/WAF resource names')
 param environmentType string = 'dev'
 
-@description('Zero-padded instance number for resource-group-scoped resources')
-param instanceNumber string = '001'
-
 @allowed([
   'lean'
   'reference'
@@ -84,7 +81,7 @@ var regionAbbreviations = {
 
 var normalizedLocation = toLower(replace(location, ' ', ''))
 var regionShort = regionAbbreviations[?normalizedLocation] ?? take(normalizedLocation, 4)
-var resourceGroupName = 'rg-${toLower(workloadName)}-${toLower(environmentType)}-${regionShort}-${instanceNumber}'
+var resourceGroupName = 'rg-${toLower(workloadName)}-${toLower(environmentType)}-${regionShort}'
 
 var commonTags = {
   'azd-env-name': environmentName
@@ -95,7 +92,7 @@ var commonTags = {
   managedBy: 'azd-bicep'
 }
 
-// WAF/CAF Resource Group (`rg-demofactory-dev-swc-001`)
+// WAF/CAF Resource Group (`rg-demofactory-dev-swc`)
 resource rg 'Microsoft.Resources/resourceGroups@2024-03-01' = {
   name: resourceGroupName
   location: location
@@ -112,7 +109,6 @@ module resources './resources.bicep' = {
     workloadShort: workloadShort
     environmentType: environmentType
     regionShort: regionShort
-    instanceNumber: instanceNumber
     deploymentProfile: deploymentProfile
     principalId: principalId
     principalType: principalType

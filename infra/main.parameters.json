@@ -17,9 +17,6 @@
     "environmentType": {
       "value": "${FACTORY_ENVIRONMENT_TYPE=dev}"
     },
-    "instanceNumber": {
-      "value": "${FACTORY_INSTANCE_NUMBER=001}"
-    },
     "deploymentProfile": {
       "value": "${FACTORY_DEPLOYMENT_PROFILE=lean}"
     },
