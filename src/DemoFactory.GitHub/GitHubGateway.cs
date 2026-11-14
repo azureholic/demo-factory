@@ -1,6 +1,7 @@
 using System.Net.Http.Headers;
 using System.Net.Http.Json;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using DemoFactory.Domain;
 using DemoFactory.Infrastructure;
 using Microsoft.EntityFrameworkCore;
@@ -38,12 +39,50 @@ public sealed record AppInstallationCheckResult(
     string InstallUrl,
     string Detail);
 
+public sealed record LivePullRequestSnapshot(
+    int Number,
+    string NodeId,
+    string Title,
+    string Body,
+    string HeadRef,
+    string HeadSha,
+    string BaseRef,
+    string AuthorLogin,
+    bool IsFork,
+    bool IsDraft,
+    string State,
+    bool Merged,
+    string? MergeableState,
+    IReadOnlyList<int> LinkedIssueNumbers,
+    bool CopilotWorkFinished,
+    bool CopilotWorkInProgress,
+    DateTimeOffset? LastCopilotFinishedAt = null);
+
+public sealed record LivePullRequestGateSignals(
+    int PrNumber,
+    string HeadSha,
+    bool IsDraft,
+    string State,
+    bool Merged,
+    string? MergeableState,
+    IReadOnlyList<CheckRunSnapshot> CheckRuns,
+    IReadOnlyList<string> CiFailureExcerpts,
+    bool HasCopilotReviewOnHeadSha,
+    bool CopilotReviewerRequested,
+    IReadOnlyList<RawReviewComment> ReviewComments,
+    IReadOnlyList<ChangedFileDiff> ChangedFiles);
+
 public interface IGitHubGateway
 {
     Task<AppInstallationCheckResult> CheckAppInstallationAsync(string owner, string? repo = null, CancellationToken ct = default);
     Task<string> CreateRepositoryFromTemplateAsync(string templateOwner, string templateRepo, string newOwner, string newRepo, bool isPublic, string specMarkdown, string adrMarkdown, CancellationToken ct = default);
     Task ApplySecurityBaselineAsync(string owner, string repo, bool isPublic, CancellationToken ct = default);
     Task ApplyRulesetsAndSettingsAsync(string owner, string repo, IReadOnlyList<string> requiredChecks, CancellationToken ct = default);
+    Task<bool> EnsureWorkflowsAndRulesetReadyAsync(long installationId, string owner, string repo, string templateId, IReadOnlyList<string> requiredChecks, CancellationToken ct = default);
+    Task<IReadOnlyList<LivePullRequestSnapshot>> InspectOpenPullRequestsAsync(string owner, string repo, CancellationToken ct = default);
+    Task<LivePullRequestSnapshot?> InspectSinglePullRequestAsync(string owner, string repo, int prNumber, CancellationToken ct = default);
+    Task<LivePullRequestGateSignals> GetPullRequestGateSignalsAsync(string owner, string repo, int prNumber, string headSha, CancellationToken ct = default);
+    Task<bool> TrySquashMergePullRequestAsync(string owner, string repo, int prNumber, string expectedHeadSha, CancellationToken ct = default);
     Task<(string ProjectId, int ProjectNumber)> CopyProjectBoardAsync(string owner, string repo, string title, CancellationToken ct = default);
     Task<CreatedIssueRef> CreateIssueAsync(string owner, string repo, string title, string body, IReadOnlyList<string> labels, CancellationToken ct = default);
     Task UpdateIssueAsync(string owner, string repo, int issueNumber, string title, string body, CancellationToken ct = default);
@@ -351,10 +390,62 @@ public sealed class GitHubGateway(
             var rulesetsExist = await HasExistingRulesetAsync(http, owner, repo, "demo-factory-main-protection", ct);
             if (!rulesetsExist)
             {
+                var codeQlActive = await IsCodeQlDefaultSetupConfiguredAsync(http, owner, repo, ct);
                 var checksList = requiredChecks
                     .Select(c => (object)new { context = c, integration_id = appOptions.Value.ActionsIntegrationId })
                     .Append(new { context = ReviewGateEvaluator.GateCheckName, integration_id = appOptions.Value.DemoFactoryIntegrationId })
                     .ToArray();
+
+                var rulesList = new List<object>
+                {
+                    new { type = "deletion" },
+                    new { type = "non_fast_forward" },
+                    new
+                    {
+                        type = "pull_request",
+                        parameters = new
+                        {
+                            required_approving_review_count = 0,
+                            dismiss_stale_reviews_on_push = false,
+                            require_code_owner_review = false,
+                            require_last_push_approval = false,
+                            required_review_thread_resolution = false
+                        }
+                    },
+                    new
+                    {
+                        type = "copilot_code_review",
+                        parameters = new
+                        {
+                            review_on_push = true,
+                            review_draft_pull_requests = false
+                        }
+                    },
+                    new
+                    {
+                        type = "required_status_checks",
+                        parameters = new
+                        {
+                            strict_required_status_checks_policy = true,
+                            required_status_checks = checksList
+                        }
+                    }
+                };
+
+                if (codeQlActive)
+                {
+                    rulesList.Add(new
+                    {
+                        type = "code_scanning",
+                        parameters = new
+                        {
+                            code_scanning_tools = new[]
+                            {
+                                new { tool = "CodeQL", security_alerts_threshold = "high_or_higher", alerts_threshold = "errors" }
+                            }
+                        }
+                    });
+                }
 
                 var fullRulesetApplied = await TrySendGitHubRestAsync(http, HttpMethod.Post, $"/repos/{owner}/{repo}/rulesets", new
                 {
@@ -365,52 +456,7 @@ public sealed class GitHubGateway(
                     {
                         ref_name = new { include = new[] { "~DEFAULT_BRANCH" }, exclude = Array.Empty<string>() }
                     },
-                    rules = new object[]
-                    {
-                        new { type = "deletion" },
-                        new { type = "non_fast_forward" },
-                        new
-                        {
-                            type = "pull_request",
-                            parameters = new
-                            {
-                                required_approving_review_count = 0,
-                                dismiss_stale_reviews_on_push = false,
-                                require_code_owner_review = false,
-                                require_last_push_approval = false,
-                                required_review_thread_resolution = false
-                            }
-                        },
-                        new
-                        {
-                            type = "copilot_code_review",
-                            parameters = new
-                            {
-                                review_on_push = true,
-                                review_draft_pull_requests = false
-                            }
-                        },
-                        new
-                        {
-                            type = "required_status_checks",
-                            parameters = new
-                            {
-                                strict_required_status_checks_policy = true,
-                                required_status_checks = checksList
-                            }
-                        },
-                        new
-                        {
-                            type = "code_scanning",
-                            parameters = new
-                            {
-                                code_scanning_tools = new[]
-                                {
-                                    new { tool = "CodeQL", security_alerts_threshold = "high_or_higher", alerts_threshold = "errors" }
-                                }
-                            }
-                        }
-                    }
+                    rules = rulesList.ToArray()
                 }, ct);
 
                 if (!fullRulesetApplied)
@@ -462,6 +508,482 @@ public sealed class GitHubGateway(
             $"{owner}/{repo}",
             after: new { requiredChecks, gateCheck = ReviewGateEvaluator.GateCheckName, copilotReviewOnPush = true },
             ct: ct);
+    }
+
+    public async Task<bool> EnsureWorkflowsAndRulesetReadyAsync(
+        long installationId,
+        string owner,
+        string repo,
+        string templateId,
+        IReadOnlyList<string> requiredChecks,
+        CancellationToken ct = default)
+    {
+        await EnsureRepoAllowlistedAsync(owner, repo, ct);
+        if (IsSandbox)
+            return false;
+
+        var resolvedInstallationId = await ResolveLiveInstallationIdAsync(installationId, owner, repo, ct);
+        using var delegatedHttp = await CreateDelegatedHttpAsync(ct);
+        HttpClient? installHttp = null;
+        if (resolvedInstallationId > 0)
+        {
+            try
+            {
+                installHttp = await CreateInstallationHttpAsync(resolvedInstallationId, ct);
+            }
+            catch (Exception ex)
+            {
+                logger.LogWarning(ex, "Falling back to delegated token in EnsureWorkflowsAndRulesetReadyAsync for {Owner}/{Repo}", owner, repo);
+            }
+        }
+
+        using var _ = installHttp;
+        var writeHttp = installHttp ?? delegatedHttp;
+
+        // Only enforce CodeQL in ruleset once CodeQL default setup is configured AND at least one PR has merged source code onto main
+        await using var checkDb = await dbFactory.CreateDbContextAsync(ct);
+        var repoEntity = await checkDb.Repositories.FirstOrDefaultAsync(r => r.Owner == owner && r.Name == repo, ct);
+        var hasMergedCodeOnMain = repoEntity is not null
+            && await checkDb.WorkItems.AnyAsync(w => w.RepoId == repoEntity.Id && w.State == WorkItemStateKind.Merged, ct);
+
+        // 1. Inspect existing ruleset & check whether .github/workflows/ci.yml is missing
+        var codeQlConfigured = hasMergedCodeOnMain && (await IsCodeQlDefaultSetupConfiguredAsync(writeHttp, owner, repo, ct)
+            || await IsCodeQlDefaultSetupConfiguredAsync(delegatedHttp, owner, repo, ct));
+
+        using var existingCi = await TryGetJsonAsync(writeHttp, $"/repos/{owner}/{repo}/contents/.github/workflows/ci.yml", ct);
+        var missingCiWorkflow = existingCi is null;
+
+        long? rulesetId = null;
+        var hasCodeScanningRule = false;
+        using (var rulesetsDoc = await TryGetJsonAsync(delegatedHttp, $"/repos/{owner}/{repo}/rulesets", ct))
+        {
+            if (rulesetsDoc is not null && rulesetsDoc.RootElement.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var rs in rulesetsDoc.RootElement.EnumerateArray())
+                {
+                    var name = rs.TryGetProperty("name", out var np) ? np.GetString() : null;
+                    if (!string.Equals(name, "demo-factory-main-protection", StringComparison.OrdinalIgnoreCase))
+                        continue;
+
+                    rulesetId = rs.GetProperty("id").GetInt64();
+                    using var detailDoc = await TryGetJsonAsync(delegatedHttp, $"/repos/{owner}/{repo}/rulesets/{rulesetId.Value}", ct);
+                    if (detailDoc is not null)
+                    {
+                        var root = detailDoc.RootElement;
+                        hasCodeScanningRule = root.TryGetProperty("rules", out var rArr)
+                            && rArr.ValueKind == JsonValueKind.Array
+                            && rArr.EnumerateArray().Any(r => r.TryGetProperty("type", out var tp) && tp.GetString() == "code_scanning");
+                    }
+                    break;
+                }
+            }
+        }
+
+        async Task PutRulesetAsync(string enforcement)
+        {
+            if (!rulesetId.HasValue)
+                return;
+
+            var checksList = requiredChecks
+                .Select(c => (object)new { context = c, integration_id = appOptions.Value.ActionsIntegrationId })
+                .Append(new { context = ReviewGateEvaluator.GateCheckName, integration_id = appOptions.Value.DemoFactoryIntegrationId })
+                .ToArray();
+
+            var updatedRules = new List<object>
+            {
+                new { type = "deletion" },
+                new { type = "non_fast_forward" },
+                new
+                {
+                    type = "pull_request",
+                    parameters = new
+                    {
+                        required_approving_review_count = 0,
+                        dismiss_stale_reviews_on_push = false,
+                        require_code_owner_review = false,
+                        require_last_push_approval = false,
+                        required_review_thread_resolution = false
+                    }
+                },
+                new
+                {
+                    type = "copilot_code_review",
+                    parameters = new
+                    {
+                        review_on_push = true,
+                        review_draft_pull_requests = false
+                    }
+                },
+                new
+                {
+                    type = "required_status_checks",
+                    parameters = new
+                    {
+                        strict_required_status_checks_policy = true,
+                        required_status_checks = checksList
+                    }
+                }
+            };
+
+            if (codeQlConfigured)
+            {
+                updatedRules.Add(new
+                {
+                    type = "code_scanning",
+                    parameters = new
+                    {
+                        code_scanning_tools = new[]
+                        {
+                            new { tool = "CodeQL", security_alerts_threshold = "high_or_higher", alerts_threshold = "errors" }
+                        }
+                    }
+                });
+            }
+
+            var updated = await TrySendGitHubRestAsync(delegatedHttp, HttpMethod.Put, $"/repos/{owner}/{repo}/rulesets/{rulesetId.Value}", new
+            {
+                name = "demo-factory-main-protection",
+                target = "branch",
+                enforcement,
+                conditions = new
+                {
+                    ref_name = new { include = new[] { "~DEFAULT_BRANCH" }, exclude = Array.Empty<string>() }
+                },
+                rules = updatedRules.ToArray()
+            }, ct);
+
+            if (!updated)
+            {
+                await TrySendGitHubRestAsync(delegatedHttp, HttpMethod.Put, $"/repos/{owner}/{repo}/rulesets/{rulesetId.Value}", new
+                {
+                    name = "demo-factory-main-protection",
+                    target = "branch",
+                    enforcement,
+                    conditions = new
+                    {
+                        ref_name = new { include = new[] { "~DEFAULT_BRANCH" }, exclude = Array.Empty<string>() }
+                    },
+                    rules = updatedRules.Where(r => !JsonSerializer.Serialize(r).Contains("copilot_code_review", StringComparison.Ordinal)).ToArray()
+                }, ct);
+            }
+        }
+
+        if (!missingCiWorkflow)
+        {
+            if (rulesetId.HasValue && hasCodeScanningRule && !codeQlConfigured)
+            {
+                await PutRulesetAsync("active");
+            }
+            return false;
+        }
+
+        var templateKey = templateId.Contains("python", StringComparison.OrdinalIgnoreCase) ? "python-fastapi" : "dotnet-react";
+        var templateDir = ResolveTemplateDirectory(templateKey);
+        var workflowsDir = Path.Combine(templateDir, ".github", "workflows");
+        if (!Directory.Exists(workflowsDir))
+            return false;
+
+        var seededAny = false;
+        try
+        {
+            // Temporarily pause branch ruleset enforcement so bootstrap workflows can be seeded onto default branch
+            if (rulesetId.HasValue)
+            {
+                await PutRulesetAsync("disabled");
+            }
+
+            foreach (var wfFile in Directory.EnumerateFiles(workflowsDir, "*.yml", SearchOption.TopDirectoryOnly))
+            {
+                var relPath = $".github/workflows/{Path.GetFileName(wfFile)}";
+                var content = await File.ReadAllTextAsync(wfFile, ct);
+                try
+                {
+                    await PaceWriteAsync(ct);
+                    await UpsertRepoFileHttpAsync(writeHttp, owner, repo, relPath, content, $"chore(ci): seed golden-path workflow {Path.GetFileName(wfFile)}", ct);
+                    seededAny = true;
+                }
+                catch (HttpRequestException ex) when (ex.StatusCode is System.Net.HttpStatusCode.Forbidden or System.Net.HttpStatusCode.NotFound or System.Net.HttpStatusCode.UnprocessableEntity or System.Net.HttpStatusCode.Conflict)
+                {
+                    try
+                    {
+                        await UpsertRepoFileHttpAsync(delegatedHttp, owner, repo, relPath, content, $"chore(ci): seed golden-path workflow {Path.GetFileName(wfFile)}", ct);
+                        seededAny = true;
+                    }
+                    catch (Exception innerEx)
+                    {
+                        logger.LogWarning(innerEx, "Unable to backfill workflow {Path} on {Owner}/{Repo}", relPath, owner, repo);
+                    }
+                }
+            }
+
+            var qualityFile = Path.Combine(templateDir, "scripts", "quality");
+            if (seededAny && File.Exists(qualityFile))
+            {
+                try
+                {
+                    var qualityContent = await File.ReadAllTextAsync(qualityFile, ct);
+                    await UpsertRepoFileHttpAsync(delegatedHttp, owner, repo, "scripts/quality", qualityContent, "chore(ci): sync standalone test runner in scripts/quality", ct);
+                }
+                catch (Exception ex)
+                {
+                    logger.LogDebug(ex, "Optional scripts/quality sync skipped on {Owner}/{Repo}", owner, repo);
+                }
+            }
+        }
+        finally
+        {
+            if (rulesetId.HasValue)
+            {
+                await PutRulesetAsync("active");
+            }
+        }
+
+        if (seededAny)
+        {
+            await auditLogger.RecordAsync(
+                appOptions.Value.AppSlug,
+                "GoldenPathWorkflowsBackfilled",
+                "Repository",
+                $"{owner}/{repo}",
+                after: new { templateKey },
+                ct: ct);
+        }
+
+        return seededAny;
+    }
+
+    public async Task<IReadOnlyList<LivePullRequestSnapshot>> InspectOpenPullRequestsAsync(
+        string owner,
+        string repo,
+        CancellationToken ct = default)
+    {
+        await EnsureRepoAllowlistedAsync(owner, repo, ct);
+        if (IsSandbox)
+            return [];
+
+        using var http = await CreateDelegatedHttpAsync(ct);
+        using var prsDoc = await TryGetJsonAsync(http, $"/repos/{owner}/{repo}/pulls?state=open&per_page=30", ct);
+        if (prsDoc is null || prsDoc.RootElement.ValueKind != JsonValueKind.Array)
+            return [];
+
+        var results = new List<LivePullRequestSnapshot>();
+        foreach (var prEl in prsDoc.RootElement.EnumerateArray())
+        {
+            var prNumber = prEl.GetProperty("number").GetInt32();
+            var snap = await BuildPrSnapshotAsync(http, owner, repo, prEl, prNumber, includeTimeline: true, ct);
+            results.Add(snap);
+        }
+
+        return results;
+    }
+
+    public async Task<LivePullRequestSnapshot?> InspectSinglePullRequestAsync(
+        string owner,
+        string repo,
+        int prNumber,
+        CancellationToken ct = default)
+    {
+        await EnsureRepoAllowlistedAsync(owner, repo, ct);
+        if (IsSandbox)
+            return null;
+
+        using var http = await CreateDelegatedHttpAsync(ct);
+        using var prDoc = await TryGetJsonAsync(http, $"/repos/{owner}/{repo}/pulls/{prNumber}", ct);
+        if (prDoc is null)
+            return null;
+
+        var state = prDoc.RootElement.TryGetProperty("state", out var st) ? st.GetString() ?? "open" : "open";
+        return await BuildPrSnapshotAsync(http, owner, repo, prDoc.RootElement, prNumber, includeTimeline: state == "open", ct);
+    }
+
+    public async Task<LivePullRequestGateSignals> GetPullRequestGateSignalsAsync(
+        string owner,
+        string repo,
+        int prNumber,
+        string headSha,
+        CancellationToken ct = default)
+    {
+        await EnsureRepoAllowlistedAsync(owner, repo, ct);
+        if (IsSandbox)
+        {
+            return new LivePullRequestGateSignals(
+                prNumber, headSha, false, "open", false, "clean", [], [], true, false, [], []);
+        }
+
+        using var http = await CreateDelegatedHttpAsync(ct);
+        using var prDoc = await SendGitHubRestForJsonAsync(http, HttpMethod.Get, $"/repos/{owner}/{repo}/pulls/{prNumber}", null, ct);
+        var prRoot = prDoc.RootElement;
+        var currentSha = prRoot.TryGetProperty("head", out var hd) && hd.TryGetProperty("sha", out var sh)
+            ? sh.GetString() ?? headSha
+            : headSha;
+        var isDraft = prRoot.TryGetProperty("draft", out var dr) && dr.ValueKind == JsonValueKind.True;
+        var state = prRoot.TryGetProperty("state", out var st) ? st.GetString() ?? "open" : "open";
+        var merged = prRoot.TryGetProperty("merged", out var mg) && mg.ValueKind == JsonValueKind.True;
+        var mergeableState = prRoot.TryGetProperty("mergeable_state", out var ms) ? ms.GetString() : null;
+
+        var copilotReviewerRequested = false;
+        if (prRoot.TryGetProperty("requested_reviewers", out var rr) && rr.ValueKind == JsonValueKind.Array)
+        {
+            copilotReviewerRequested = rr.EnumerateArray().Any(u =>
+                u.TryGetProperty("login", out var lg) &&
+                lg.GetString() is { } login &&
+                (TrustBoundary.IsCopilotReviewer(login) || login.Contains("copilot", StringComparison.OrdinalIgnoreCase)));
+        }
+
+        // 1. Check-runs on head SHA
+        var checkRuns = new List<CheckRunSnapshot>();
+        var ciFailures = new List<string>();
+        using (var checksDoc = await TryGetJsonAsync(http, $"/repos/{owner}/{repo}/commits/{currentSha}/check-runs?per_page=100", ct))
+        {
+            if (checksDoc is not null && checksDoc.RootElement.TryGetProperty("check_runs", out var crArr) && crArr.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var cr in crArr.EnumerateArray())
+                {
+                    var name = cr.TryGetProperty("name", out var n) ? n.GetString() ?? string.Empty : string.Empty;
+                    var crStatus = cr.TryGetProperty("status", out var s) ? s.GetString() ?? "queued" : "queued";
+                    var conclusion = cr.TryGetProperty("conclusion", out var c) && c.ValueKind == JsonValueKind.String ? c.GetString() : null;
+                    var appSlug = cr.TryGetProperty("app", out var a) && a.ValueKind == JsonValueKind.Object && a.TryGetProperty("slug", out var sl)
+                        ? sl.GetString() ?? string.Empty
+                        : string.Empty;
+
+                    checkRuns.Add(new CheckRunSnapshot(name, currentSha, crStatus, conclusion, appSlug));
+
+                    if (!string.Equals(name, ReviewGateEvaluator.GateCheckName, StringComparison.OrdinalIgnoreCase)
+                        && string.Equals(crStatus, "completed", StringComparison.OrdinalIgnoreCase)
+                        && conclusion is "failure" or "timed_out" or "cancelled" or "startup_failure")
+                    {
+                        var outSummary = cr.TryGetProperty("output", out var outObj) && outObj.ValueKind == JsonValueKind.Object
+                            ? (outObj.TryGetProperty("summary", out var sm) ? sm.GetString() : null) ?? (outObj.TryGetProperty("title", out var tl) ? tl.GetString() : null)
+                            : null;
+                        var trimmed = string.IsNullOrWhiteSpace(outSummary)
+                            ? $"Check '{name}' failed with conclusion '{conclusion}'."
+                            : $"Check '{name}' failed: {outSummary[..Math.Min(400, outSummary.Length)]}";
+                        ciFailures.Add(trimmed);
+                    }
+                }
+            }
+        }
+
+        // 2. Copilot reviews & inline review comments
+        var hasCopilotReview = false;
+        using (var reviewsDoc = await TryGetJsonAsync(http, $"/repos/{owner}/{repo}/pulls/{prNumber}/reviews?per_page=100", ct))
+        {
+            if (reviewsDoc is not null && reviewsDoc.RootElement.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var rv in reviewsDoc.RootElement.EnumerateArray())
+                {
+                    var author = rv.TryGetProperty("user", out var u) && u.ValueKind == JsonValueKind.Object && u.TryGetProperty("login", out var l)
+                        ? l.GetString() ?? string.Empty
+                        : string.Empty;
+                    var commitId = rv.TryGetProperty("commit_id", out var cid) ? cid.GetString() : null;
+                    if (TrustBoundary.IsCopilotReviewer(author) || author.Contains("copilot", StringComparison.OrdinalIgnoreCase))
+                    {
+                        if (string.IsNullOrWhiteSpace(commitId) || string.Equals(commitId, currentSha, StringComparison.OrdinalIgnoreCase))
+                            hasCopilotReview = true;
+                    }
+                }
+            }
+        }
+
+        var rawComments = new List<RawReviewComment>();
+        using (var commentsDoc = await TryGetJsonAsync(http, $"/repos/{owner}/{repo}/pulls/{prNumber}/comments?per_page=100", ct))
+        {
+            if (commentsDoc is not null && commentsDoc.RootElement.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var cm in commentsDoc.RootElement.EnumerateArray())
+                {
+                    var author = cm.TryGetProperty("user", out var u) && u.ValueKind == JsonValueKind.Object && u.TryGetProperty("login", out var l)
+                        ? l.GetString() ?? string.Empty
+                        : string.Empty;
+                    if (!TrustBoundary.IsCopilotReviewer(author) && !author.Contains("copilot", StringComparison.OrdinalIgnoreCase))
+                        continue;
+
+                    var commitId = cm.TryGetProperty("commit_id", out var cid) ? cid.GetString() : null;
+                    if (!string.IsNullOrWhiteSpace(commitId) && !string.Equals(commitId, currentSha, StringComparison.OrdinalIgnoreCase))
+                        continue;
+
+                    var path = cm.TryGetProperty("path", out var p) ? p.GetString() ?? string.Empty : string.Empty;
+                    int? line = cm.TryGetProperty("line", out var ln) && ln.ValueKind == JsonValueKind.Number ? ln.GetInt32() : null;
+                    var diffHunk = cm.TryGetProperty("diff_hunk", out var dh) ? dh.GetString() : null;
+                    var body = cm.TryGetProperty("body", out var bd) ? bd.GetString() ?? string.Empty : string.Empty;
+                    rawComments.Add(new RawReviewComment(author, path, line, diffHunk, body));
+                }
+            }
+        }
+
+        // 3. Changed files (ignore machine-generated lockfile line bloat in additions/deletions)
+        var changedFiles = new List<ChangedFileDiff>();
+        using (var filesDoc = await TryGetJsonAsync(http, $"/repos/{owner}/{repo}/pulls/{prNumber}/files?per_page=100", ct))
+        {
+            if (filesDoc is not null && filesDoc.RootElement.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var fl in filesDoc.RootElement.EnumerateArray())
+                {
+                    var filename = fl.TryGetProperty("filename", out var fn) ? fn.GetString() ?? string.Empty : string.Empty;
+                    var isLockFile = filename.EndsWith("package-lock.json", StringComparison.OrdinalIgnoreCase)
+                        || filename.EndsWith("pnpm-lock.yaml", StringComparison.OrdinalIgnoreCase)
+                        || filename.EndsWith("yarn.lock", StringComparison.OrdinalIgnoreCase)
+                        || filename.EndsWith("packages.lock.json", StringComparison.OrdinalIgnoreCase);
+                    var additions = isLockFile ? 0 : (fl.TryGetProperty("additions", out var ad) ? ad.GetInt32() : 0);
+                    var deletions = isLockFile ? 0 : (fl.TryGetProperty("deletions", out var dl) ? dl.GetInt32() : 0);
+                    var patch = fl.TryGetProperty("patch", out var pt) && pt.ValueKind == JsonValueKind.String ? pt.GetString() : null;
+                    changedFiles.Add(new ChangedFileDiff(filename, additions, deletions, patch));
+                }
+            }
+        }
+
+        return new LivePullRequestGateSignals(
+            prNumber,
+            currentSha,
+            isDraft,
+            state,
+            merged,
+            mergeableState,
+            checkRuns,
+            ciFailures,
+            hasCopilotReview,
+            copilotReviewerRequested,
+            rawComments,
+            changedFiles);
+    }
+
+    public async Task<bool> TrySquashMergePullRequestAsync(
+        string owner,
+        string repo,
+        int prNumber,
+        string expectedHeadSha,
+        CancellationToken ct = default)
+    {
+        await EnsureRepoAllowlistedAsync(owner, repo, ct);
+        await PaceWriteAsync(ct);
+        if (IsSandbox)
+            return true;
+
+        // First try arming GraphQL auto-merge (handles waiting if any external check is still finishing)
+        await EnableAutoMergeSquashAsync(owner, repo, prNumber, ct);
+
+        // If all checks + review-gate are already green ("clean"), GitHub requires direct squash merge
+        using var http = await CreateDelegatedHttpAsync(ct);
+        using var mergeResp = await http.PutAsJsonAsync($"https://api.github.com/repos/{owner}/{repo}/pulls/{prNumber}/merge", new
+        {
+            merge_method = "squash",
+            sha = expectedHeadSha
+        }, ct);
+
+        if (mergeResp.IsSuccessStatusCode)
+        {
+            await auditLogger.RecordAsync(
+                appOptions.Value.AppSlug,
+                "PullRequestSquashMerged",
+                "PullRequest",
+                $"{owner}/{repo}#{prNumber}",
+                prNumber: prNumber,
+                sha: expectedHeadSha,
+                ct: ct);
+            return true;
+        }
+
+        return false;
     }
 
     public async Task<(string ProjectId, int ProjectNumber)> CopyProjectBoardAsync(
@@ -806,13 +1328,18 @@ public sealed class GitHubGateway(
         if (IsSandbox)
             return;
 
-        var octokit = await CreateDelegatedOctokitAsync(ct);
-        var pr = await octokit.PullRequest.Get(owner, repo, prNumber);
+        using var http = await CreateDelegatedHttpAsync(ct);
+        using var prDoc = await SendGitHubRestForJsonAsync(http, HttpMethod.Get, $"/repos/{owner}/{repo}/pulls/{prNumber}", null, ct);
+        var currentDraft = prDoc.RootElement.TryGetProperty("draft", out var dr) && dr.ValueKind == JsonValueKind.True;
+        if (currentDraft == isDraft)
+            return;
+
+        var nodeId = prDoc.RootElement.GetProperty("node_id").GetString()!;
         var mutation = isDraft
             ? "mutation($id: ID!) { convertPullRequestToDraft(input: { pullRequestId: $id }) { pullRequest { isDraft } } }"
             : "mutation($id: ID!) { markPullRequestReadyForReview(input: { pullRequestId: $id }) { pullRequest { isDraft } } }";
 
-        using var _ = await ExecuteGraphQlAsync(mutation, new { id = pr.NodeId }, ct);
+        using var _ = await ExecuteGraphQlAsync(mutation, new { id = nodeId }, ct);
     }
 
     public async Task EnableAutoMergeSquashAsync(string owner, string repo, int prNumber, CancellationToken ct = default)
@@ -822,17 +1349,26 @@ public sealed class GitHubGateway(
         if (IsSandbox)
             return;
 
-        var octokit = await CreateDelegatedOctokitAsync(ct);
-        var pr = await octokit.PullRequest.Get(owner, repo, prNumber);
-        const string mutation = """
-            mutation ArmAutoMerge($prId: ID!) {
-              enablePullRequestAutoMerge(input: { pullRequestId: $prId, mergeMethod: SQUASH }) {
-                pullRequest { id }
-              }
-            }
-            """;
+        try
+        {
+            using var http = await CreateDelegatedHttpAsync(ct);
+            using var prDoc = await SendGitHubRestForJsonAsync(http, HttpMethod.Get, $"/repos/{owner}/{repo}/pulls/{prNumber}", null, ct);
+            var nodeId = prDoc.RootElement.GetProperty("node_id").GetString()!;
+            const string mutation = """
+                mutation ArmAutoMerge($prId: ID!) {
+                  enablePullRequestAutoMerge(input: { pullRequestId: $prId, mergeMethod: SQUASH }) {
+                    pullRequest { id }
+                  }
+                }
+                """;
 
-        using var _ = await ExecuteGraphQlAsync(mutation, new { prId = pr.NodeId }, ct);
+            using var _ = await ExecuteGraphQlAsync(mutation, new { prId = nodeId }, ct);
+        }
+        catch (Exception ex)
+        {
+            // GitHub returns GraphQL error if PR is already in clean status or still draft; TrySquashMergePullRequestAsync handles clean merges directly
+            logger.LogInformation("enablePullRequestAutoMerge skipped/deferred on {Owner}/{Repo}#{PrNumber}: {Reason}", owner, repo, prNumber, ex.Message);
+        }
     }
 
     public async Task<bool> UpdatePullRequestBranchAsync(string owner, string repo, int prNumber, CancellationToken ct = default)
@@ -956,25 +1492,55 @@ public sealed class GitHubGateway(
                 resolvedInstallationId = check.InstallationId.Value;
         }
 
-        if (!IsSandbox && resolvedInstallationId > 0 && resolvedInstallationId != 90421001)
+        if (!IsSandbox)
         {
-            using var http = await CreateInstallationHttpAsync(resolvedInstallationId, ct);
             var summaryMd = string.Join("\n", result.Conditions
                 .Where(c => c.Applicable)
                 .Select(c => $"- {(c.Passed ? "PASS" : c.IsPending ? "WAIT" : "FAIL")} **C{c.Number} {c.Name}**: {c.Summary}"));
 
-            await SendGitHubRestAsync(http, HttpMethod.Post, $"/repos/{owner}/{repo}/check-runs", new
+            var outputPayload = new
             {
-                name = ReviewGateEvaluator.GateCheckName,
-                head_sha = headSha,
-                status,
-                conclusion,
-                output = new
+                title = $"Gate ({result.Profile}): {result.Outcome.GetType().Name}",
+                summary = summaryMd
+            };
+
+            object checkRunPayload = conclusion is null
+                ? new
                 {
-                    title = $"Gate ({result.Profile}): {result.Outcome.GetType().Name}",
-                    summary = summaryMd
+                    name = ReviewGateEvaluator.GateCheckName,
+                    head_sha = headSha,
+                    status,
+                    output = outputPayload
                 }
-            }, ct);
+                : new
+                {
+                    name = ReviewGateEvaluator.GateCheckName,
+                    head_sha = headSha,
+                    status,
+                    conclusion,
+                    output = outputPayload
+                };
+
+            var postedWithApp = false;
+            if (resolvedInstallationId > 0 && resolvedInstallationId != 90421001)
+            {
+                try
+                {
+                    using var appHttp = await CreateInstallationHttpAsync(resolvedInstallationId, ct);
+                    await SendGitHubRestAsync(appHttp, HttpMethod.Post, $"/repos/{owner}/{repo}/check-runs", checkRunPayload, ct);
+                    postedWithApp = true;
+                }
+                catch (Exception ex)
+                {
+                    logger.LogWarning(ex, "Installation check-run post failed on {Owner}/{Repo}@{Sha}; retrying with delegated App user token.", owner, repo, headSha);
+                }
+            }
+
+            if (!postedWithApp)
+            {
+                using var delegatedHttp = await CreateDelegatedHttpAsync(ct);
+                await TrySendGitHubRestAsync(delegatedHttp, HttpMethod.Post, $"/repos/{owner}/{repo}/check-runs", checkRunPayload, ct);
+            }
         }
 
         await auditLogger.RecordAsync(
@@ -1330,6 +1896,142 @@ public sealed class GitHubGateway(
             }
             await Task.Delay(400, ct);
         }
+    }
+
+    private static async Task<bool> IsCodeQlDefaultSetupConfiguredAsync(HttpClient http, string owner, string repo, CancellationToken ct)
+    {
+        using var doc = await TryGetJsonAsync(http, $"/repos/{owner}/{repo}/code-scanning/default-setup", ct);
+        if (doc is null)
+            return false;
+        return doc.RootElement.TryGetProperty("state", out var st)
+            && string.Equals(st.GetString(), "configured", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private async Task<long> ResolveLiveInstallationIdAsync(long installationId, string owner, string repo, CancellationToken ct)
+    {
+        if (installationId > 0 && installationId != 90421001)
+            return installationId;
+        var check = await CheckAppInstallationAsync(owner, repo, ct);
+        return check.InstallationId ?? 0L;
+    }
+
+    private string ResolveTemplateDirectory(string templateKey)
+    {
+        var baseDir = envOptions.Value.TemplatesDirectory;
+        if (!Path.IsPathRooted(baseDir))
+        {
+            var fromCwd = Path.Combine(Directory.GetCurrentDirectory(), baseDir);
+            var fromRoot = Path.GetFullPath(Path.Combine(Directory.GetCurrentDirectory(), "..", "..", baseDir));
+            baseDir = Directory.Exists(fromCwd) ? fromCwd : Directory.Exists(fromRoot) ? fromRoot : fromCwd;
+        }
+        return Path.Combine(baseDir, templateKey);
+    }
+
+    private static readonly Regex LinkedIssueRegex = new(
+        @"(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+#(\d+)",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+    private static async Task<LivePullRequestSnapshot> BuildPrSnapshotAsync(
+        HttpClient http,
+        string owner,
+        string repo,
+        JsonElement prEl,
+        int prNumber,
+        bool includeTimeline,
+        CancellationToken ct)
+    {
+        var nodeId = prEl.TryGetProperty("node_id", out var nid) ? nid.GetString() ?? string.Empty : string.Empty;
+        var title = prEl.TryGetProperty("title", out var tl) ? tl.GetString() ?? string.Empty : string.Empty;
+        var body = prEl.TryGetProperty("body", out var bd) && bd.ValueKind == JsonValueKind.String ? bd.GetString() ?? string.Empty : string.Empty;
+        var author = prEl.TryGetProperty("user", out var u) && u.ValueKind == JsonValueKind.Object && u.TryGetProperty("login", out var l)
+            ? l.GetString() ?? string.Empty
+            : string.Empty;
+        var headEl = prEl.GetProperty("head");
+        var headRef = headEl.TryGetProperty("ref", out var rf) ? rf.GetString() ?? string.Empty : string.Empty;
+        var headSha = headEl.TryGetProperty("sha", out var sh) ? sh.GetString() ?? string.Empty : string.Empty;
+        var isFork = headEl.TryGetProperty("repo", out var hr) && hr.ValueKind == JsonValueKind.Object && hr.TryGetProperty("fork", out var fk) && fk.ValueKind == JsonValueKind.True;
+        var baseRef = prEl.TryGetProperty("base", out var bs) && bs.ValueKind == JsonValueKind.Object && bs.TryGetProperty("ref", out var br)
+            ? br.GetString() ?? "main"
+            : "main";
+        var isDraft = prEl.TryGetProperty("draft", out var dr) && dr.ValueKind == JsonValueKind.True;
+        var state = prEl.TryGetProperty("state", out var st) ? st.GetString() ?? "open" : "open";
+        var merged = prEl.TryGetProperty("merged", out var mg) && mg.ValueKind == JsonValueKind.True
+            || (prEl.TryGetProperty("merged_at", out var ma) && ma.ValueKind == JsonValueKind.String);
+        var mergeableState = prEl.TryGetProperty("mergeable_state", out var ms) && ms.ValueKind == JsonValueKind.String ? ms.GetString() : null;
+
+        var linkedIssues = new HashSet<int>();
+        foreach (Match m in LinkedIssueRegex.Matches($"{title}\n{body}"))
+        {
+            if (int.TryParse(m.Groups[1].Value, out var num))
+                linkedIssues.Add(num);
+        }
+
+        var copilotFinished = !isDraft;
+        var copilotInProgress = false;
+        DateTimeOffset? lastFinishedAt = null;
+
+        if (includeTimeline)
+        {
+            using var timelineDoc = await TryGetJsonAsync(http, $"/repos/{owner}/{repo}/issues/{prNumber}/timeline?per_page=100", ct);
+            if (timelineDoc is not null && timelineDoc.RootElement.ValueKind == JsonValueKind.Array)
+            {
+                var lastStartIdx = -1;
+                var lastFinishIdx = -1;
+                var idx = 0;
+                foreach (var ev in timelineDoc.RootElement.EnumerateArray())
+                {
+                    var evType = ev.TryGetProperty("event", out var et) ? et.GetString() : null;
+                    if (string.Equals(evType, "copilot_work_started", StringComparison.OrdinalIgnoreCase))
+                        lastStartIdx = idx;
+                    else if (string.Equals(evType, "copilot_work_finished", StringComparison.OrdinalIgnoreCase))
+                    {
+                        lastFinishIdx = idx;
+                        if (ev.TryGetProperty("created_at", out var ca) && ca.ValueKind == JsonValueKind.String && DateTimeOffset.TryParse(ca.GetString(), out var parsedTs))
+                        {
+                            lastFinishedAt = parsedTs;
+                        }
+                    }
+                    else if (string.Equals(evType, "cross-referenced", StringComparison.OrdinalIgnoreCase)
+                             && ev.TryGetProperty("source", out var src)
+                             && src.TryGetProperty("issue", out var srcIssue)
+                             && srcIssue.TryGetProperty("number", out var inum))
+                    {
+                        linkedIssues.Add(inum.GetInt32());
+                    }
+                    idx++;
+                }
+
+                if (lastFinishIdx >= 0 && lastFinishIdx > lastStartIdx)
+                {
+                    copilotFinished = true;
+                    copilotInProgress = false;
+                }
+                else if (lastStartIdx > lastFinishIdx)
+                {
+                    copilotFinished = false;
+                    copilotInProgress = true;
+                }
+            }
+        }
+
+        return new LivePullRequestSnapshot(
+            prNumber,
+            nodeId,
+            title,
+            body,
+            headRef,
+            headSha,
+            baseRef,
+            author,
+            isFork,
+            isDraft,
+            state,
+            merged,
+            mergeableState,
+            linkedIssues.ToList(),
+            copilotFinished,
+            copilotInProgress,
+            lastFinishedAt);
     }
 
     private async Task SeedGoldenPathTemplateFilesAsync(HttpClient http, string owner, string repo, string templateRepo, CancellationToken ct)

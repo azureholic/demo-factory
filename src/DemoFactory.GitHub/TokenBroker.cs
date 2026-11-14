@@ -102,7 +102,7 @@ public sealed class GitHubAppJwtSigner(IOptions<GitHubAppOptions> options) : IGi
         else if (!string.IsNullOrWhiteSpace(options.Value.PrivateKeyPem))
         {
             using var pemRsa = RSA.Create();
-            pemRsa.ImportFromPem(options.Value.PrivateKeyPem);
+            pemRsa.ImportFromPem(NormalizePem(options.Value.PrivateKeyPem));
             signature = pemRsa.SignHash(digest, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
         }
         else
@@ -111,6 +111,25 @@ public sealed class GitHubAppJwtSigner(IOptions<GitHubAppOptions> options) : IGi
         }
 
         return $"{signingInput}.{Base64UrlEncode(signature)}";
+    }
+
+    private static string NormalizePem(string raw)
+    {
+        var trimmed = raw.Trim().Trim('"').Replace("\\r\\n", "\n").Replace("\\n", "\n");
+        if (!trimmed.Contains("-----BEGIN", StringComparison.Ordinal))
+        {
+            try
+            {
+                var decoded = Encoding.UTF8.GetString(Convert.FromBase64String(trimmed));
+                if (decoded.Contains("-----BEGIN", StringComparison.Ordinal))
+                    return decoded.Replace("\\r\\n", "\n").Replace("\\n", "\n").Trim();
+            }
+            catch
+            {
+                // Keep trimmed string if not base64-wrapped PEM
+            }
+        }
+        return trimmed;
     }
 
     private static string Base64UrlEncode(ReadOnlySpan<byte> bytes) =>

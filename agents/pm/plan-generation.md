@@ -3,6 +3,7 @@
 Decompose the specification into an actionable, dependency-ordered backlog:
 - Produce architecture outline (`adr0001Markdown`) covering services, data model, synthetic seed strategy, and preview readiness.
 - Start with a `Small` walking-skeleton issue (`ISS-1`) that gets `main`, CI, health probes, and demo seed data green (`initialStatus: "Ready"`).
+- Set `initialStatus: "Ready"` on all planned items so unblocked downstream slices start automatically as soon as their `blockedByKeys` prerequisites merge (only use `"Backlog"` for explicitly deferred stretch items).
 - Ignore out-of-scope disclaimers and answered clarification Q&A metadata when extracting requirements; extract only concrete in-scope functional/non-functional `REQ-nnn` requirements.
 - For every feature issue of size `Medium` or larger, emit a dedicated `AT: <title>` acceptance-test issue (`isAcceptanceTest: true`) and add its key to the feature issue's `blockedByKeys`.
 - Map every issue and acceptance test to `REQ-nnn` IDs.

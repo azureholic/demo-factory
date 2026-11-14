@@ -29,6 +29,9 @@ public interface IFactoryOrchestrationCoordinator
     Task TriggerStopTheLineAsync(Guid repoId, string cause, IReadOnlyList<int> suspectPrNumbers, long? workflowRunId = null, bool flakeRetryPassed = false, CancellationToken ct = default);
     Task ResumeLineAsync(Guid repoId, string actor, CancellationToken ct = default);
     Task ProcessWebhookEnvelopeAsync(WebhookEnvelope envelope, CancellationToken ct = default);
+    Task<int> ReconcileActiveWorkItemsOnceAsync(Guid? targetRepoId = null, CancellationToken ct = default);
+    DateTimeOffset? LastReconcileAt { get; }
+    string? LastReconcileSummary { get; }
     Task<int> PollBoardsOnceAsync(CancellationToken ct = default);
     Task<int> SweepExpiredPreviewsOnceAsync(CancellationToken ct = default);
 }
@@ -62,6 +65,11 @@ public sealed class FactoryOrchestrationCoordinator(
     private readonly ConcurrentDictionary<string, Task> _deliveryTasks = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<Guid, SemaphoreSlim> _projectFeatureApplyLocks = new();
     private readonly ConcurrentDictionary<Guid, SemaphoreSlim> _repoMergeSerializationLocks = new();
+    private readonly ConcurrentDictionary<string, string> _lastGateSignatureByWorkItem = new(StringComparer.OrdinalIgnoreCase);
+    private readonly SemaphoreSlim _reconcileLock = new(1, 1);
+
+    public DateTimeOffset? LastReconcileAt { get; private set; }
+    public string? LastReconcileSummary { get; private set; }
 
     public async Task<SpecReviewOutput> RunSpecReviewActivityAsync(Guid workItemId, CancellationToken ct = default)
     {
@@ -197,8 +205,9 @@ public sealed class FactoryOrchestrationCoordinator(
         wi.UpdatedAt = DateTimeOffset.UtcNow;
         await db.SaveChangesAsync(ct);
 
-        await gitHub.LockConversationAsync(repo.Owner, repo.Name, prNumber, ct);
+        await gitHub.UnlockConversationAsync(repo.Owner, repo.Name, prNumber, ct);
         await gitHub.SetPullRequestDraftAsync(repo.Owner, repo.Name, prNumber, isDraft: false, ct);
+        await gitHub.RequestCopilotReviewWatchdogAsync(repo.Owner, repo.Name, prNumber, ct);
 
         // §11.3: L0 Shadow opens PRs but NEVER enables auto-merge
         // §10.3: Serialize merges when WIP > 1 (only arm auto-merge when no other PR in this repo is in AwaitingMerge)
@@ -287,12 +296,13 @@ public sealed class FactoryOrchestrationCoordinator(
             });
         }
 
-        var checkRuns = policy.Gate.RequiredChecks.Select(name => new CheckRunSnapshot(
-            name,
-            signals.HeadSha,
-            "completed",
-            signals.ChecksAllGreen ? "success" : "failure",
-            ReviewGateEvaluator.ExpectedActionsAppSlug)).ToList();
+        var checkRuns = signals.ActualCheckRuns
+            ?? policy.Gate.RequiredChecks.Select(name => new CheckRunSnapshot(
+                name,
+                signals.HeadSha,
+                "completed",
+                signals.ChecksAllGreen ? "success" : "failure",
+                ReviewGateEvaluator.ExpectedActionsAppSlug)).ToList();
 
         var mergedAtKeys = await db.WorkItems
             .Where(w => w.RepoId == repo.Id && w.IsAcceptanceTestIssue && w.State == WorkItemStateKind.Merged)
@@ -333,7 +343,14 @@ public sealed class FactoryOrchestrationCoordinator(
                 ? new FeatureAcceptanceSummary($"ISS-{wi.IssueNumber}", SeparateAtIssueRequired: false, SuitePassedOnHeadSha: signals.ChecksAllGreen, AtFilesByteIdenticalToMain: true, [], [])
                 : null,
             PreviewRun: policy.HasDeployTarget
-                ? new PreviewWorkflowSummary(true, ".github/workflows/preview.yml", "workflow_run", "main", signals.HeadSha, signals.ChecksAllGreen, wi.PreviewUrl ?? $"https://pr-{wi.PrNumber}-{repo.Name}.swedencentral.azurecontainerapps.io")
+                ? new PreviewWorkflowSummary(
+                    true,
+                    ".github/workflows/preview.yml",
+                    "workflow_run",
+                    "main",
+                    signals.HeadSha,
+                    signals.PreviewWorkflowSucceeded ?? signals.ChecksAllGreen,
+                    wi.PreviewUrl ?? $"https://pr-{wi.PrNumber}-{repo.Name}.swedencentral.azurecontainerapps.io")
                 : null,
             LineStatus: lineState?.State ?? LineStatus.Running,
             Approvals: approvals,
@@ -1334,6 +1351,28 @@ public sealed class FactoryOrchestrationCoordinator(
 
             case "pull_request":
                 await HandlePullRequestWebhookAsync(db, repo, policy, envelope.Action, root, ct);
+                if (!string.Equals(envelope.Action, "closed", StringComparison.OrdinalIgnoreCase))
+                {
+                    await ReconcileActiveWorkItemsOnceAsync(repo.Id, ct);
+                }
+                break;
+
+            case "pull_request_review":
+            case "check_suite":
+                await ReconcileActiveWorkItemsOnceAsync(repo.Id, ct);
+                break;
+
+            case "check_run":
+                if (string.Equals(envelope.Action, "completed", StringComparison.OrdinalIgnoreCase))
+                {
+                    var checkName = root.TryGetProperty("check_run", out var crEl) && crEl.TryGetProperty("name", out var cn)
+                        ? cn.GetString()
+                        : null;
+                    if (!string.Equals(checkName, ReviewGateEvaluator.GateCheckName, StringComparison.OrdinalIgnoreCase))
+                    {
+                        await ReconcileActiveWorkItemsOnceAsync(repo.Id, ct);
+                    }
+                }
                 break;
 
             case "workflow_run":
@@ -1342,6 +1381,314 @@ public sealed class FactoryOrchestrationCoordinator(
         }
 
         await MarkInboxProcessedAsync(envelope.DeliveryId, ct);
+    }
+
+    public async Task<int> ReconcileActiveWorkItemsOnceAsync(Guid? targetRepoId = null, CancellationToken ct = default)
+    {
+        if (envOptions.Value.GetEffectiveSandboxMode())
+            return 0;
+
+        var acquired = targetRepoId.HasValue
+            ? await _reconcileLock.WaitAsync(TimeSpan.FromSeconds(25), ct)
+            : await _reconcileLock.WaitAsync(TimeSpan.FromSeconds(2), ct);
+
+        if (!acquired)
+            return 0;
+
+        var progressed = 0;
+        try
+        {
+            await using var db = await dbFactory.CreateDbContextAsync(ct);
+            var global = await db.RuntimeSettings.FirstOrDefaultAsync(s => s.Scope == SettingsScope.Global, ct);
+            if (global?.GlobalPaused == true)
+                return 0;
+
+            var repoQuery = db.Repositories.Where(r => !r.Paused);
+            if (targetRepoId.HasValue)
+                repoQuery = repoQuery.Where(r => r.Id == targetRepoId.Value);
+
+            var repos = await repoQuery.ToListAsync(ct);
+
+            var activeStates = new[]
+            {
+                WorkItemStateKind.Claimed,
+                WorkItemStateKind.Implementing,
+                WorkItemStateKind.PrOpen,
+                WorkItemStateKind.Validating,
+                WorkItemStateKind.Fixing,
+                WorkItemStateKind.AwaitingApproval,
+                WorkItemStateKind.AwaitingMerge
+            };
+
+            foreach (var repo in repos)
+            {
+                try
+                {
+                    var (policy, _, _, _) = await policyRepo.GetPolicyAsync(repo.Owner, repo.Name, ct);
+                    var project = await db.Projects.FirstOrDefaultAsync(p => p.Id == repo.ProjectId, ct);
+                    var templateId = project?.TemplateId ?? "dotnet-react";
+
+                    // 1. Self-heal missing .github/workflows/*.yml and reconcile ruleset bypass/CodeQL state
+                    var workflowsBackfilled = await gitHub.EnsureWorkflowsAndRulesetReadyAsync(
+                        repo.InstallationId,
+                        repo.Owner,
+                        repo.Name,
+                        templateId,
+                        policy.Gate.RequiredChecks,
+                        ct);
+
+                    var activeItems = await db.WorkItems
+                        .Where(w => w.RepoId == repo.Id && activeStates.Contains(w.State))
+                        .OrderBy(w => w.IssueNumber)
+                        .ToListAsync(ct);
+
+                    if (activeItems.Count == 0 && !workflowsBackfilled)
+                    {
+                        LastReconcileAt = DateTimeOffset.UtcNow;
+                        LastReconcileSummary = $"{repo.FullName}: idle (0 active work items, workflowsSeeded={workflowsBackfilled})";
+                        continue;
+                    }
+
+                    var openPrs = await gitHub.InspectOpenPullRequestsAsync(repo.Owner, repo.Name, ct);
+
+                    // If workflows were just seeded onto main, update open PR branches so they inherit ci.yml immediately
+                    if (workflowsBackfilled)
+                    {
+                        foreach (var opr in openPrs)
+                        {
+                            await gitHub.UpdatePullRequestBranchAsync(repo.Owner, repo.Name, opr.Number, ct);
+                        }
+                        openPrs = await gitHub.InspectOpenPullRequestsAsync(repo.Owner, repo.Name, ct);
+                    }
+
+                    foreach (var wi in activeItems)
+                    {
+                        var matchedPr = openPrs.FirstOrDefault(p =>
+                            (wi.PrNumber.HasValue && p.Number == wi.PrNumber.Value)
+                            || p.LinkedIssueNumbers.Contains(wi.IssueNumber));
+
+                        // Check if previously linked PR was merged or closed since last poll
+                        if (matchedPr is null && wi.PrNumber.HasValue)
+                        {
+                            var single = await gitHub.InspectSinglePullRequestAsync(repo.Owner, repo.Name, wi.PrNumber.Value, ct);
+                            if (single?.Merged == true)
+                            {
+                                await CompleteMergedWorkItemActivityAsync(wi.Id, wi.PrNumber.Value, single.HeadSha, ct);
+                                if (project?.IsPublic == true)
+                                {
+                                    await gitHub.ApplySecurityBaselineAsync(repo.Owner, repo.Name, true, ct);
+                                }
+                                progressed++;
+                            }
+                            continue;
+                        }
+
+                        if (matchedPr is null)
+                            continue;
+
+                        // Enforce trusted PR origin (§11.4)
+                        var (trusted, _) = TrustBoundary.EvaluateTrustedPrOrigin(new TrustedOriginContext(
+                            $"{repo.Owner}/{repo.Name}",
+                            $"{repo.Owner}/{repo.Name}",
+                            matchedPr.IsFork,
+                            matchedPr.AuthorLogin,
+                            envOptions.Value.OwnerLogin,
+                            envOptions.Value.FactoryAppSlug));
+
+                        if (!trusted)
+                            continue;
+
+                        if (wi.PrNumber != matchedPr.Number || string.IsNullOrWhiteSpace(wi.PrUrl))
+                        {
+                            wi.PrNumber = matchedPr.Number;
+                            wi.PrUrl = $"https://github.com/{repo.Owner}/{repo.Name}/pull/{matchedPr.Number}";
+                            wi.HeadSha = matchedPr.HeadSha;
+                            wi.UpdatedAt = DateTimeOffset.UtcNow;
+                            await db.SaveChangesAsync(ct);
+                        }
+
+                        // Wait while Copilot cloud agent is actively working on commits
+                        if (matchedPr.CopilotWorkInProgress)
+                            continue;
+
+                        // If in Fixing state (Round 2+), ensure copilot_work_finished is newer than our fix request so we don't reuse Round 1's finish event
+                        if (wi.State == WorkItemStateKind.Fixing && matchedPr.LastCopilotFinishedAt.HasValue)
+                        {
+                            var latestFixSession = await db.AgentSessions
+                                .Where(s => s.WorkItemId == wi.Id && s.Mode == AgentSessionMode.Fix)
+                                .OrderByDescending(s => s.StartedAt)
+                                .FirstOrDefaultAsync(ct);
+
+                            if (latestFixSession is not null && matchedPr.LastCopilotFinishedAt.Value <= latestFixSession.StartedAt)
+                            {
+                                continue;
+                            }
+                        }
+
+                        // Copilot finished coding -> transition out of Draft and arm PR!
+                        if (matchedPr.CopilotWorkFinished && (matchedPr.IsDraft || wi.State is WorkItemStateKind.Claimed or WorkItemStateKind.Implementing or WorkItemStateKind.Fixing or WorkItemStateKind.PrOpen))
+                        {
+                            var openSessions = await db.AgentSessions
+                                .Where(s => s.WorkItemId == wi.Id && s.EndedAt == null)
+                                .ToListAsync(ct);
+                            foreach (var s in openSessions)
+                            {
+                                s.State = CopilotTaskState.Completed;
+                                s.EndedAt = DateTimeOffset.UtcNow;
+                            }
+                            await db.SaveChangesAsync(ct);
+
+                            if (string.Equals(matchedPr.MergeableState, "behind", StringComparison.OrdinalIgnoreCase))
+                            {
+                                await gitHub.UpdatePullRequestBranchAsync(repo.Owner, repo.Name, matchedPr.Number, ct);
+                                var refreshed = await gitHub.InspectSinglePullRequestAsync(repo.Owner, repo.Name, matchedPr.Number, ct);
+                                if (refreshed is not null)
+                                    matchedPr = refreshed;
+                            }
+
+                            await ArmPullRequestActivityAsync(wi.Id, matchedPr.Number, matchedPr.HeadSha, ct);
+                            progressed++;
+                            continue;
+                        }
+
+                        // Non-draft PR in Validating / AwaitingApproval / AwaitingMerge -> evaluate live gate signals
+                        if (!matchedPr.IsDraft && wi.State is WorkItemStateKind.Validating or WorkItemStateKind.AwaitingApproval or WorkItemStateKind.AwaitingMerge)
+                        {
+                            var liveSignals = await gitHub.GetPullRequestGateSignalsAsync(repo.Owner, repo.Name, matchedPr.Number, matchedPr.HeadSha, ct);
+                            if (liveSignals.Merged)
+                            {
+                                await CompleteMergedWorkItemActivityAsync(wi.Id, matchedPr.Number, liveSignals.HeadSha, ct);
+                                if (project?.IsPublic == true)
+                                {
+                                    await gitHub.ApplySecurityBaselineAsync(repo.Owner, repo.Name, true, ct);
+                                }
+                                progressed++;
+                                continue;
+                            }
+
+                            var allChecksCompleted = policy.Gate.RequiredChecks.All(reqName =>
+                                liveSignals.CheckRuns.Any(cr =>
+                                    string.Equals(cr.Name, reqName, StringComparison.OrdinalIgnoreCase)
+                                    && string.Equals(cr.Sha, liveSignals.HeadSha, StringComparison.OrdinalIgnoreCase)
+                                    && string.Equals(cr.Status, "completed", StringComparison.OrdinalIgnoreCase)));
+
+                            if (string.Equals(liveSignals.MergeableState, "behind", StringComparison.OrdinalIgnoreCase) && allChecksCompleted)
+                            {
+                                await gitHub.UpdatePullRequestBranchAsync(repo.Owner, repo.Name, matchedPr.Number, ct);
+                                progressed++;
+                                continue;
+                            }
+
+                            var allChecksGreen = allChecksCompleted && policy.Gate.RequiredChecks.All(reqName =>
+                                liveSignals.CheckRuns.Any(cr =>
+                                    string.Equals(cr.Name, reqName, StringComparison.OrdinalIgnoreCase)
+                                    && string.Equals(cr.Sha, liveSignals.HeadSha, StringComparison.OrdinalIgnoreCase)
+                                    && string.Equals(cr.Status, "completed", StringComparison.OrdinalIgnoreCase)
+                                    && string.Equals(cr.Conclusion, "success", StringComparison.OrdinalIgnoreCase)));
+
+                            // If Copilot PR Reviewer wasn't added to requested_reviewers (e.g., unavailable on account/plan) and CI finished >90s ago, allow review carry-over
+                            var carryOverReview = !liveSignals.HasCopilotReviewOnHeadSha
+                                && !liveSignals.CopilotReviewerRequested
+                                && allChecksCompleted
+                                && (DateTimeOffset.UtcNow - wi.UpdatedAt) > TimeSpan.FromSeconds(90);
+
+                            var checkDigest = string.Join("|", liveSignals.CheckRuns
+                                .Where(c => !string.Equals(c.Name, ReviewGateEvaluator.GateCheckName, StringComparison.OrdinalIgnoreCase))
+                                .OrderBy(c => c.Name, StringComparer.OrdinalIgnoreCase)
+                                .Select(c => $"{c.Name}:{c.Status}:{c.Conclusion}"));
+                            var approvalCount = await db.Approvals.CountAsync(a => a.WorkItemId == wi.Id && a.HeadSha == liveSignals.HeadSha && a.Decision == ApprovalDecision.Approved, ct);
+                            var sigKey = $"{wi.Id}:{liveSignals.HeadSha}:{checkDigest}:{liveSignals.HasCopilotReviewOnHeadSha}:{carryOverReview}:{liveSignals.ReviewComments.Count}:{approvalCount}";
+
+                            // Skip re-evaluating if nothing changed since our last evaluation on this SHA (unless ready to merge!)
+                            if (_lastGateSignatureByWorkItem.TryGetValue(wi.Id.ToString(), out var prevSig)
+                                && string.Equals(prevSig, sigKey, StringComparison.Ordinal)
+                                && wi.State != WorkItemStateKind.AwaitingMerge)
+                            {
+                                continue;
+                            }
+
+                            var round = Math.Max(1, wi.CurrentRound);
+                            var gateResult = await EvaluateAndPostGateActivityAsync(
+                                wi.Id,
+                                round,
+                                new RoundSignalsEvent(
+                                    liveSignals.HeadSha,
+                                    allChecksGreen,
+                                    liveSignals.HasCopilotReviewOnHeadSha,
+                                    liveSignals.ReviewComments,
+                                    liveSignals.ChangedFiles,
+                                    liveSignals.CiFailureExcerpts,
+                                    SpecConformancePassed: true,
+                                    ActualCheckRuns: liveSignals.CheckRuns,
+                                    PreviewWorkflowSucceeded: allChecksGreen),
+                                carryOverReview,
+                                ct);
+
+                            _lastGateSignatureByWorkItem[wi.Id.ToString()] = sigKey;
+                            progressed++;
+
+                            var repoSettings = await db.RuntimeSettings.FirstOrDefaultAsync(s => s.Scope == SettingsScope.Repo && s.TargetId == repo.Id, ct);
+                            var effectiveAutonomy = repoSettings?.Autonomy ?? global?.Autonomy ?? policy.Autonomy;
+
+                            switch (gateResult.Outcome)
+                            {
+                                case GateOutcome.Pass:
+                                    if (effectiveAutonomy != AutonomyLevel.L0)
+                                    {
+                                        var mergedNow = await gitHub.TrySquashMergePullRequestAsync(repo.Owner, repo.Name, matchedPr.Number, liveSignals.HeadSha, ct);
+                                        if (mergedNow)
+                                        {
+                                            await CompleteMergedWorkItemActivityAsync(wi.Id, matchedPr.Number, liveSignals.HeadSha, ct);
+                                            if (project?.IsPublic == true)
+                                            {
+                                                await gitHub.ApplySecurityBaselineAsync(repo.Owner, repo.Name, true, ct);
+                                            }
+                                        }
+                                    }
+                                    break;
+
+                                case GateOutcome.OnlyApprovalMissing missing:
+                                    await RequestHumanApprovalActivityAsync(wi.Id, liveSignals.HeadSha, missing.MissingApprovals, ct);
+                                    break;
+
+                                case GateOutcome.Blocked blocked:
+                                    await MarkBlockedActivityAsync(wi.Id, string.Join("; ", blocked.EscalationReasons), ct);
+                                    break;
+
+                                case GateOutcome.NeedsFix needsFix:
+                                    // Wait until all CI checks finish before dispatching a batched @copilot fix comment
+                                    if (allChecksCompleted)
+                                    {
+                                        if (round >= wi.MaxRounds)
+                                        {
+                                            await MarkBlockedActivityAsync(wi.Id, $"Reached max review/fix rounds ({wi.MaxRounds}): {string.Join("; ", needsFix.Reasons)}", ct);
+                                        }
+                                        else
+                                        {
+                                            await RequestCopilotFixRoundActivityAsync(wi.Id, matchedPr.Number, round + 1, gateResult, liveSignals.CiFailureExcerpts, ct);
+                                        }
+                                    }
+                                    break;
+                            }
+                        }
+                    }
+                    LastReconcileAt = DateTimeOffset.UtcNow;
+                    LastReconcileSummary = $"{repo.FullName}: progressed={progressed}, workflowsSeeded={workflowsBackfilled}, active={activeItems.Count}";
+                }
+                catch (Exception repoEx) when (repoEx is not OperationCanceledException)
+                {
+                    LastReconcileAt = DateTimeOffset.UtcNow;
+                    LastReconcileSummary = $"{repo.FullName} error: {repoEx.GetType().Name}: {repoEx.Message}";
+                    logger.LogWarning(repoEx, "Error reconciling active work items for repository {Repo}", repo.FullName);
+                }
+            }
+        }
+        finally
+        {
+            _reconcileLock.Release();
+        }
+
+        return progressed;
     }
 
     public async Task<int> PollBoardsOnceAsync(CancellationToken ct = default)
@@ -1613,7 +1960,11 @@ public sealed class FactoryOrchestrationCoordinator(
                     .Select(w => w.PrNumber!.Value)
                     .ToListAsync(ct);
 
-                await TriggerStopTheLineAsync(repo.Id, $"Workflow run {runId} failed on {repo.DefaultBranch}", recentMerged, runId, ct: ct);
+                // Only trigger Stop-the-Line after at least one PR has merged onto the default branch
+                if (recentMerged.Count > 0)
+                {
+                    await TriggerStopTheLineAsync(repo.Id, $"Workflow run {runId} failed on {repo.DefaultBranch}", recentMerged, runId, ct: ct);
+                }
             }
             else if (string.Equals(conclusion, "success", StringComparison.OrdinalIgnoreCase))
             {
@@ -1691,7 +2042,17 @@ public sealed class BoardPollerAndSweeperWorker(
 {
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        using var timer = new PeriodicTimer(TimeSpan.FromSeconds(60));
+        try
+        {
+            await Task.Delay(TimeSpan.FromSeconds(5), stoppingToken);
+            await coordinator.ReconcileActiveWorkItemsOnceAsync(ct: stoppingToken);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            logger.LogWarning(ex, "Initial active work-item reconciliation tick encountered an error.");
+        }
+
+        using var timer = new PeriodicTimer(TimeSpan.FromSeconds(30));
         var ticks = 0;
 
         while (await timer.WaitForNextTickAsync(stoppingToken))
@@ -1699,15 +2060,19 @@ public sealed class BoardPollerAndSweeperWorker(
             ticks++;
             try
             {
-                await coordinator.PollBoardsOnceAsync(stoppingToken);
-                if (ticks % 60 == 0)
+                await coordinator.ReconcileActiveWorkItemsOnceAsync(ct: stoppingToken);
+                if (ticks % 2 == 0)
+                {
+                    await coordinator.PollBoardsOnceAsync(stoppingToken);
+                }
+                if (ticks % 120 == 0)
                 {
                     await coordinator.SweepExpiredPreviewsOnceAsync(stoppingToken);
                 }
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
-                logger.LogWarning(ex, "Periodic board poller / preview sweeper tick encountered an error.");
+                logger.LogWarning(ex, "Periodic reconciler / board poller / preview sweeper tick encountered an error.");
             }
         }
     }

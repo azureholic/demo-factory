@@ -71,7 +71,9 @@ public sealed record RoundSignalsEvent(
     IReadOnlyList<RawReviewComment> ReviewComments,
     IReadOnlyList<ChangedFileDiff> ChangedFiles,
     IReadOnlyList<string> CiFailureExcerpts,
-    bool SpecConformancePassed = true);
+    bool SpecConformancePassed = true,
+    IReadOnlyList<CheckRunSnapshot>? ActualCheckRuns = null,
+    bool? PreviewWorkflowSucceeded = null);
 
 public sealed record OperatorDecisionEvent(
     ApprovalDecision Decision,

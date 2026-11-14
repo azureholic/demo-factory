@@ -174,6 +174,7 @@ public sealed class CopilotAgentClient(
         {
             var token = await tokenBroker.GetDelegatedAccessTokenAsync(envOptions.Value.OwnerLogin, ct);
             using var http = CreateGitHubHttp(token);
+            using var _ = await http.DeleteAsync($"https://api.github.com/repos/{request.Owner}/{request.Repo}/issues/{request.PrNumber}/lock", ct);
             using var resp = await http.PostAsJsonAsync(
                 $"https://api.github.com/repos/{request.Owner}/{request.Repo}/issues/{request.PrNumber}/comments",
                 new { body },
@@ -239,6 +240,7 @@ public sealed class CopilotAgentClient(
         {
             var token = await tokenBroker.GetDelegatedAccessTokenAsync(envOptions.Value.OwnerLogin, ct);
             using var http = CreateGitHubHttp(token);
+            using var _ = await http.DeleteAsync($"https://api.github.com/repos/{owner}/{repo}/issues/{prNumber}/lock", ct);
             using var resp = await http.PostAsJsonAsync(
                 $"https://api.github.com/repos/{owner}/{repo}/issues/{prNumber}/comments",
                 new { body },

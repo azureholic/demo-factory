@@ -16,9 +16,15 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
       - uses: azure/login@a457da9ea143d694b1b9c7c869ebb04ebe844ef5
+        if: vars.AZURE_DEMO_CLIENT_ID != ''
         with:
           client-id: ${{ vars.AZURE_DEMO_CLIENT_ID }}
           tenant-id: ${{ vars.AZURE_TENANT_ID }}
           subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
       - name: Deploy stable demo Container App (synthetic seed only, zero secrets)
-        run: echo "Deploying ca-demo-${{ github.event.repository.name }} from main@${{ github.sha }}"
+        run: |
+          if [ -z "${{ vars.AZURE_DEMO_CLIENT_ID }}" ]; then
+            echo "AZURE_DEMO_CLIENT_ID not configured; skipping live demo deployment."
+          else
+            echo "Deploying ca-demo-${{ github.event.repository.name }} from main@${{ github.sha }}"
+          fi

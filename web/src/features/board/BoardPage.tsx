@@ -5,6 +5,7 @@ import {
   Card,
   Dropdown,
   Option,
+  Spinner,
   Text,
   Tooltip,
   tokens
@@ -13,7 +14,7 @@ import { LockClosed16Regular } from '@fluentui/react-icons';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useNavigate } from 'react-router-dom';
 import { BoardCardDto, BoardStatus, api } from '../../api/client';
-import { EmptyState, PageSkeleton, SessionRing, StatusPill } from '../../components/SharedComponents';
+import { EmptyState, OperationProgressBanner, PageSkeleton, SessionRing, StatusPill } from '../../components/SharedComponents';
 
 const COLUMNS: { key: BoardStatus; label: string; agentOwned: boolean }[] = [
   { key: 'Backlog', label: 'Backlog', agentOwned: false },
@@ -62,12 +63,23 @@ export const BoardPage: React.FC<{ repoId?: string; projectId?: string }> = ({ r
     }
   });
 
+  const queueAllMutation = useMutation({
+    mutationFn: () => api.queueAllBacklog(repoId!),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['board'] });
+      qc.invalidateQueries({ queryKey: ['graph'] });
+      qc.invalidateQueries({ queryKey: ['sessions'] });
+    },
+    onError: (err: Error) => setMoveError(err.message)
+  });
+
   if (!repoId) {
     return <EmptyState title="No repository selected" description="Select or create a project to view its board." />;
   }
   if (boardQuery.isLoading) return <PageSkeleton cards={6} />;
 
   const cards = boardQuery.data?.cards ?? [];
+  const backlogCount = cards.filter(c => c.boardStatus === 'Backlog').length;
   const features = featuresQuery.data ?? [];
 
   return (
@@ -78,10 +90,22 @@ export const BoardPage: React.FC<{ repoId?: string; projectId?: string }> = ({ r
             Project Board — {boardQuery.data?.repoFullName}
           </Text>
           <Text size={200} style={{ color: tokens.colorNeutralForeground3 }}>
-            Mirrors GitHub Projects v2. Humans may drag between Backlog, Ready, and Blocked; agent columns are locked.
+            Humans may drag between Backlog, Ready, and Blocked; agent columns are managed automatically. Items in Ready start automatically once their dependencies merge.
           </Text>
         </div>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+          {backlogCount > 0 && (
+            <Button
+              appearance="primary"
+              icon={queueAllMutation.isPending ? <Spinner size="tiny" /> : undefined}
+              disabled={queueAllMutation.isPending}
+              onClick={() => queueAllMutation.mutate()}
+            >
+              {queueAllMutation.isPending
+                ? 'Queueing & Dispatching Next Item…'
+                : `Queue All Backlog → Ready (${backlogCount})`}
+            </Button>
+          )}
           <Dropdown
             placeholder="Filter by feature"
             value={featureFilter ? `feature:${featureFilter}` : 'All features'}
@@ -96,6 +120,12 @@ export const BoardPage: React.FC<{ repoId?: string; projectId?: string }> = ({ r
           </Dropdown>
         </div>
       </div>
+
+      <OperationProgressBanner
+        active={queueAllMutation.isPending || markReadyMutation.isPending}
+        title="Moving items to Ready & dispatching next unblocked slice to Copilot…"
+        subtitle="Evaluating dependency graph, running Definition-of-Ready check, and assigning unblocked items within WIP limit."
+      />
 
       {moveError && (
         <Card style={{ padding: 10, background: tokens.colorPaletteRedBackground1 }}>

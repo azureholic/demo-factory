@@ -7,6 +7,7 @@ using DemoFactory.Api;
 using DemoFactory.Domain;
 using DemoFactory.GitHub;
 using DemoFactory.Infrastructure;
+using DemoFactory.Orchestrator;
 using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
@@ -601,6 +602,236 @@ public sealed class FactoryEndToEndTests : IAsyncLifetime
         Assert.Contains("github.com/", wiDto.GetProperty("issueUrl").GetString());
         Assert.Contains("Operator Clarification", wiDto.GetProperty("bodyMarkdown").GetString());
         Assert.Equal(2, wiDto.GetProperty("acceptanceCriteria").GetArrayLength());
+    }
+
+    [Fact]
+    public async Task EndToEnd_LiveReconciler_DetectsCopilotWorkFinished_MarksReady_EvaluatesGate_And_SquashMerges()
+    {
+        var isolatedDb = Path.Combine(Path.GetTempPath(), $"demofactory-reconcile-{Guid.NewGuid():N}.db");
+        var isolatedDir = Path.Combine(Path.GetTempPath(), $"demofactory-reconcile-dir-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(isolatedDir);
+
+        var isDraft = true;
+        var isMerged = false;
+        var markedReadyViaGraphQl = false;
+        var squashMergedViaRest = false;
+
+        try
+        {
+            using var reconcileFactory = new WebApplicationFactory<ApiAssemblyMarker>().WithWebHostBuilder(b =>
+            {
+                b.ConfigureAppConfiguration((_, cfg) =>
+                {
+                    cfg.AddInMemoryCollection(new Dictionary<string, string?>
+                    {
+                        ["ConnectionStrings:Sqlite"] = $"Data Source={isolatedDb}",
+                        ["Factory:SandboxMode"] = "false",
+                        ["Factory:AllowTestHeaderAuth"] = "true",
+                        ["Factory:LocalDataDirectory"] = isolatedDir,
+                        ["Factory:PoliciesDirectory"] = isolatedDir,
+                        ["Foundry:ProjectEndpoint"] = "",
+                        ["GitHub:AppId"] = "5758548",
+                        ["GitHub:AppSlug"] = "azureholic-demo-factory",
+                        ["GitHub:ClientId"] = "Iv23liUfMKApH3rhp0J4",
+                        ["GitHub:ClientSecret"] = "test-client-secret",
+                        ["GitHub:WritePaceMilliseconds"] = "1"
+                    });
+                });
+
+                b.ConfigureServices(services =>
+                {
+                    // Remove periodic hosted worker in test so we drive ticks deterministically
+                    var hosted = services.FirstOrDefault(d => d.ImplementationType == typeof(BoardPollerAndSweeperWorker));
+                    if (hosted is not null) services.Remove(hosted);
+
+                    services.AddHttpClient("GitHubApi")
+                        .ConfigurePrimaryHttpMessageHandler(() => new StubGitHubHttpHandler(req =>
+                        {
+                            var path = req.RequestUri!.AbsolutePath;
+
+                            if (req.Method == HttpMethod.Get && path.EndsWith("/contents/.github/workflows/ci.yml", StringComparison.Ordinal))
+                                return StubJson(HttpStatusCode.OK, new { sha = "ci_sha" });
+
+                            if (req.Method == HttpMethod.Get && path.EndsWith("/rulesets", StringComparison.Ordinal))
+                                return StubJson(HttpStatusCode.OK, Array.Empty<object>());
+
+                            if (req.Method == HttpMethod.Get && path == "/repos/azureholic/browser-beatbox-628/pulls")
+                            {
+                                if (isMerged)
+                                    return StubJson(HttpStatusCode.OK, Array.Empty<object>());
+
+                                return StubJson(HttpStatusCode.OK, new[]
+                                {
+                                    new
+                                    {
+                                        number = 10,
+                                        node_id = "PR_kwDO_10",
+                                        title = "Scaffold dotnet-react walking skeleton (REQ-001)",
+                                        body = "Implements walking skeleton.\n\n- Fixes #1",
+                                        draft = isDraft,
+                                        state = "open",
+                                        merged = false,
+                                        mergeable_state = "clean",
+                                        user = new { login = "azureholic" },
+                                        head = new { @ref = "copilot/scaffold-skeleton", sha = "719f68aba10c", repo = new { fork = false, full_name = "azureholic/browser-beatbox-628" } },
+                                        @base = new { @ref = "main" }
+                                    }
+                                });
+                            }
+
+                            if (req.Method == HttpMethod.Get && path == "/repos/azureholic/browser-beatbox-628/pulls/10")
+                            {
+                                return StubJson(HttpStatusCode.OK, new
+                                {
+                                    number = 10,
+                                    node_id = "PR_kwDO_10",
+                                    title = "Scaffold dotnet-react walking skeleton (REQ-001)",
+                                    body = "Implements walking skeleton.\n\n- Fixes #1",
+                                    draft = isDraft,
+                                    state = isMerged ? "closed" : "open",
+                                    merged = isMerged,
+                                    mergeable_state = "clean",
+                                    requested_reviewers = Array.Empty<object>(),
+                                    user = new { login = "azureholic" },
+                                    head = new { @ref = "copilot/scaffold-skeleton", sha = "719f68aba10c", repo = new { fork = false, full_name = "azureholic/browser-beatbox-628" } },
+                                    @base = new { @ref = "main" }
+                                });
+                            }
+
+                            if (req.Method == HttpMethod.Get && path == "/repos/azureholic/browser-beatbox-628/issues/10/timeline")
+                            {
+                                return StubJson(HttpStatusCode.OK, new object[]
+                                {
+                                    new { @event = "copilot_work_started" },
+                                    new { @event = "copilot_work_finished" }
+                                });
+                            }
+
+                            if (req.Method == HttpMethod.Post && path == "/graphql")
+                            {
+                                var body = req.Content!.ReadAsStringAsync().GetAwaiter().GetResult();
+                                if (body.Contains("markPullRequestReadyForReview", StringComparison.Ordinal))
+                                {
+                                    isDraft = false;
+                                    markedReadyViaGraphQl = true;
+                                    return StubJson(HttpStatusCode.OK, new { data = new { markPullRequestReadyForReview = new { pullRequest = new { isDraft = false } } } });
+                                }
+                                return StubJson(HttpStatusCode.OK, new { data = new { enablePullRequestAutoMerge = new { pullRequest = new { id = "PR_kwDO_10" } } } });
+                            }
+
+                            if (req.Method == HttpMethod.Get && path.Contains("/commits/719f68aba10c/check-runs", StringComparison.Ordinal))
+                            {
+                                return StubJson(HttpStatusCode.OK, new
+                                {
+                                    total_count = 3,
+                                    check_runs = new[]
+                                    {
+                                        new { name = "build", status = "completed", conclusion = "success", app = new { slug = "github-actions" } },
+                                        new { name = "test", status = "completed", conclusion = "success", app = new { slug = "github-actions" } },
+                                        new { name = "lint", status = "completed", conclusion = "success", app = new { slug = "github-actions" } }
+                                    }
+                                });
+                            }
+
+                            if (req.Method == HttpMethod.Get && path == "/repos/azureholic/browser-beatbox-628/pulls/10/reviews")
+                            {
+                                return StubJson(HttpStatusCode.OK, new[]
+                                {
+                                    new { id = 1, commit_id = "719f68aba10c", state = "COMMENTED", user = new { login = "copilot-pull-request-reviewer[bot]" } }
+                                });
+                            }
+
+                            if (req.Method == HttpMethod.Get && path == "/repos/azureholic/browser-beatbox-628/pulls/10/comments")
+                                return StubJson(HttpStatusCode.OK, Array.Empty<object>());
+
+                            if (req.Method == HttpMethod.Get && path == "/repos/azureholic/browser-beatbox-628/pulls/10/files")
+                            {
+                                return StubJson(HttpStatusCode.OK, new[]
+                                {
+                                    new { filename = "src/Beatbox.Api/Program.cs", additions = 45, deletions = 0, status = "added" },
+                                    new { filename = "web/package-lock.json", additions = 3200, deletions = 0, status = "added" }
+                                });
+                            }
+
+                            if (req.Method == HttpMethod.Put && path == "/repos/azureholic/browser-beatbox-628/pulls/10/merge")
+                            {
+                                isMerged = true;
+                                squashMergedViaRest = true;
+                                return StubJson(HttpStatusCode.OK, new { sha = "merged_sha_999", merged = true });
+                            }
+
+                            return StubJson(HttpStatusCode.OK, new { ok = true });
+                        }));
+                });
+            });
+
+            using var _ = reconcileFactory.CreateClient();
+            var broker = reconcileFactory.Services.GetRequiredService<ITokenBroker>();
+            await broker.StoreRotatedTokensAsync("azureholic", "ghu_live_token_reconcile", TimeSpan.FromHours(8), "ghr_live_refresh", TimeSpan.FromDays(90));
+
+            var dbFactory = reconcileFactory.Services.GetRequiredService<IDbContextFactory<DemoFactoryDbContext>>();
+            Guid repoId;
+            Guid wi1Id;
+            await using (var db = await dbFactory.CreateDbContextAsync())
+            {
+                var proj = new ProjectEntity { Name = "Browser Beatbox", Slug = "browser-beatbox-628", SpecMarkdown = "# Beatbox", TemplateId = "dotnet-react", IsPublic = true };
+                db.Projects.Add(proj);
+                var repo = new RepositoryEntity { ProjectId = proj.Id, Owner = "azureholic", Name = "browser-beatbox-628", InstallationId = 0 };
+                db.Repositories.Add(repo);
+                db.LineStates.Add(new LineStateEntity { RepoId = repo.Id, State = LineStatus.Running });
+
+                var wi1 = new WorkItemEntity
+                {
+                    RepoId = repo.Id,
+                    IssueNumber = 1,
+                    Title = "Walking skeleton",
+                    BodyMarkdown = "Scaffold app",
+                    AcceptanceCriteriaJson = "[\"Healthz returns 200\"]",
+                    LabelsJson = "[\"factory\"]",
+                    IssueAuthor = "azureholic",
+                    WorkLabelAppliedBy = "azureholic",
+                    PassesWorkLabelRule = true,
+                    GateProfile = GateProfile.Feature,
+                    State = WorkItemStateKind.Implementing,
+                    BoardStatus = BoardStatus.InProgress
+                };
+                db.WorkItems.Add(wi1);
+                await db.SaveChangesAsync();
+                repoId = repo.Id;
+                wi1Id = wi1.Id;
+            }
+
+            var coordinator = reconcileFactory.Services.GetRequiredService<IFactoryOrchestrationCoordinator>();
+
+            // Tick 1: Detects copilot_work_finished on Draft PR #10 -> marks Ready for Review via GraphQL & transitions #1 to Validating
+            var p1 = await coordinator.ReconcileActiveWorkItemsOnceAsync(repoId);
+            Assert.True(p1 > 0);
+            Assert.True(markedReadyViaGraphQl);
+
+            await using (var db = await dbFactory.CreateDbContextAsync())
+            {
+                var wi = await db.WorkItems.FirstAsync(w => w.Id == wi1Id);
+                Assert.Equal(WorkItemStateKind.Validating, wi.State);
+                Assert.Equal(10, wi.PrNumber);
+            }
+
+            // Tick 2: Evaluates green CI + Copilot review (ignoring package-lock.json line bloat) -> passes 15-condition gate & squash-merges PR #10 -> Merged/Done!
+            var p2 = await coordinator.ReconcileActiveWorkItemsOnceAsync(repoId);
+            Assert.True(p2 > 0);
+            Assert.True(squashMergedViaRest);
+
+            await using (var db = await dbFactory.CreateDbContextAsync())
+            {
+                var wi = await db.WorkItems.FirstAsync(w => w.Id == wi1Id);
+                Assert.Equal(WorkItemStateKind.Merged, wi.State);
+                Assert.Equal(BoardStatus.Done, wi.BoardStatus);
+            }
+        }
+        finally
+        {
+            if (File.Exists(isolatedDb)) { try { File.Delete(isolatedDb); } catch { } }
+            if (Directory.Exists(isolatedDir)) { try { Directory.Delete(isolatedDir, recursive: true); } catch { } }
+        }
     }
 
     private static HttpResponseMessage StubJson(HttpStatusCode code, object payload) =>

@@ -215,6 +215,7 @@ public static class OperationsAndGovernanceEndpoints
         app.MapPost("/api/repos/{id:guid}/readiness:fix", async (
             Guid id,
             IGitHubGateway gitHub,
+            IFactoryOrchestrationCoordinator coordinator,
             IDbContextFactory<DemoFactoryDbContext> dbFactory,
             CancellationToken ct) =>
         {
@@ -223,10 +224,12 @@ public static class OperationsAndGovernanceEndpoints
             if (repo is null)
                 return Results.NotFound();
 
+            var project = await db.Projects.FirstOrDefaultAsync(p => p.Id == repo.ProjectId, ct);
             await gitHub.ApplySecurityBaselineAsync(repo.Owner, repo.Name, true, ct);
             await gitHub.ApplyRulesetsAndSettingsAsync(repo.Owner, repo.Name, ["build", "test", "lint"], ct);
-            var prNum = await gitHub.OpenOnboardingProfilePrAsync(repo.Owner, repo.Name, ct);
-            return Results.Ok(new { fixedSettings = true, onboardingPrNumber = prNum });
+            await gitHub.EnsureWorkflowsAndRulesetReadyAsync(repo.InstallationId, repo.Owner, repo.Name, project?.TemplateId ?? "dotnet-react", ["build", "test", "lint"], ct);
+            await coordinator.ReconcileActiveWorkItemsOnceAsync(repo.Id, ct);
+            return Results.Ok(new { fixedSettings = true });
         }).RequireAuthorization(FactoryRoles.AdminPolicy);
 
         // Stop-the-Line endpoints (§6.2, §13)
@@ -342,6 +345,38 @@ public static class OperationsAndGovernanceEndpoints
                 cards
             });
         }).RequireAuthorization(FactoryRoles.ViewerPolicy);
+
+        app.MapPost("/api/repos/{id:guid}/board:queue-backlog", async (
+            Guid id,
+            HttpContext http,
+            IFactoryOrchestrationCoordinator coordinator,
+            IDbContextFactory<DemoFactoryDbContext> dbFactory,
+            IAuditLogger auditLogger,
+            CancellationToken ct) =>
+        {
+            await using var db = await dbFactory.CreateDbContextAsync(ct);
+            var repo = await db.Repositories.FirstOrDefaultAsync(r => r.Id == id, ct);
+            if (repo is null)
+                return Results.NotFound();
+
+            var backlogItems = await db.WorkItems
+                .Where(w => w.RepoId == id && w.BoardStatus == BoardStatus.Backlog && w.State == WorkItemStateKind.Queued)
+                .ToListAsync(ct);
+
+            var now = DateTimeOffset.UtcNow;
+            foreach (var wi in backlogItems)
+            {
+                wi.BoardStatus = BoardStatus.Ready;
+                wi.ReadyAt ??= now;
+                wi.UpdatedAt = now;
+            }
+            await db.SaveChangesAsync(ct);
+
+            var actor = http.User.Identity?.Name ?? "operator";
+            await auditLogger.RecordAsync(actor, "BoardBacklogQueuedAll", "Repository", id.ToString(), after: new { count = backlogItems.Count }, ct: ct);
+            var started = await coordinator.TriggerSchedulerAsync(id, ct);
+            return Results.Ok(new { queuedCount = backlogItems.Count, startedWorkItemIds = started });
+        }).RequireAuthorization(FactoryRoles.OperatorPolicy);
 
         app.MapGet("/api/repos/{id:guid}/graph", async (
             Guid id,
@@ -694,6 +729,7 @@ public static class OperationsAndGovernanceEndpoints
                     finding.WaivedBy = actor;
                     await db.SaveChangesAsync(ct);
                     await auditLogger.RecordAsync(actor, "FindingWaived", "Finding", finding.Id.ToString(), after: new { finding.ShortId, waiveReq.Reason }, issueNumber: wi.IssueNumber, prNumber: wi.PrNumber, ct: ct);
+                    await coordinator.ReconcileActiveWorkItemsOnceAsync(wi.RepoId, ct);
                     return Results.Ok(finding);
 
                 case "approve":
@@ -733,6 +769,7 @@ public static class OperationsAndGovernanceEndpoints
 
                     await auditLogger.RecordAsync(actor, "WorkItemApproved", "WorkItem", wi.Id.ToString(), after: new { wi.HeadSha, approveReq?.Reason }, issueNumber: wi.IssueNumber, prNumber: wi.PrNumber, sha: wi.HeadSha, ct: ct);
                     await notifier.BroadcastWorkItemChangedAsync(wi.Id, wi.RepoId, wi.State.ToString(), ct);
+                    await coordinator.ReconcileActiveWorkItemsOnceAsync(wi.RepoId, ct);
                     return Results.Ok(new { wi.Id, state = wi.State, headSha = wi.HeadSha });
 
                 case "request-changes":
@@ -1110,6 +1147,7 @@ public static class OperationsAndGovernanceEndpoints
         // Global / Repo Kill Switch (§13: POST /api/factory:pause · :resume)
         app.MapGet("/api/factory/status", async (
             ITokenBroker tokenBroker,
+            IFactoryOrchestrationCoordinator coordinator,
             IDbContextFactory<DemoFactoryDbContext> dbFactory,
             IOptions<FactoryEnvironmentOptions> envOptions,
             CancellationToken ct) =>
@@ -1131,7 +1169,9 @@ public static class OperationsAndGovernanceEndpoints
                 reconnectRequired = conn.ReconnectRequired,
                 sandboxMode = envOptions.Value.GetEffectiveSandboxMode(),
                 profile = envOptions.Value.Profile.ToString(),
-                ownerLogin = envOptions.Value.OwnerLogin
+                ownerLogin = envOptions.Value.OwnerLogin,
+                lastReconcileAt = coordinator.LastReconcileAt,
+                lastReconcileSummary = coordinator.LastReconcileSummary
             });
         });
 

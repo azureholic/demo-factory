@@ -16,12 +16,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '22'
       - uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9
         with:
           dotnet-version: '11.0.x'
+          dotnet-quality: 'preview'
       - run: ./scripts/quality build
       - name: Build container image tarball (no registry push)
-        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && hashFiles('Dockerfile') != ''
         run: |
           docker build -t preview-candidate:${{ github.event.pull_request.head.sha }} .
           docker save preview-candidate:${{ github.event.pull_request.head.sha }} -o image.tar
@@ -29,7 +33,7 @@ jobs:
           echo "${{ github.event.pull_request.head.sha }}" > head_sha.txt
           echo "${{ github.event.pull_request.user.login }}" > pr_author.txt
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && hashFiles('Dockerfile') != ''
         with:
           name: preview-image-bundle
           path: |
@@ -43,6 +47,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '22'
+      - uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9
+        with:
+          dotnet-version: '11.0.x'
+          dotnet-quality: 'preview'
       - run: ./scripts/quality lint
 
   test:
@@ -50,7 +61,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '22'
       - uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9
         with:
           dotnet-version: '11.0.x'
+          dotnet-quality: 'preview'
       - run: ./scripts/quality test

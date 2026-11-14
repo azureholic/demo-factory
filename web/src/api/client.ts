@@ -285,6 +285,10 @@ export const api = {
     request<{ repoId: string; repoFullName: string; lockedColumns: BoardStatus[]; cards: BoardCardDto[] }>(
       `/api/repos/${repoId}/board${feature ? `?feature=${encodeURIComponent(feature)}` : ''}`
     ),
+  queueAllBacklog: (repoId: string) =>
+    request<{ queuedCount: number; startedWorkItemIds: string[] }>(`/api/repos/${repoId}/board:queue-backlog`, {
+      method: 'POST'
+    }),
   getGraph: (repoId: string) => request<any>(`/api/repos/${repoId}/graph`),
   getWorkItem: (id: string) => request<any>(`/api/workitems/${id}`),
   workItemAction: (id: string, action: string, body?: any) =>
