@@ -13,7 +13,6 @@ import {
 import {
   Key20Regular,
   PersonPasskey20Regular,
-  ShieldCheckmark20Regular,
   WeatherMoon20Regular,
   WeatherSunny20Regular
 } from '@fluentui/react-icons';
@@ -90,8 +89,14 @@ export const LoginPage: React.FC<{
           justifyContent: 'space-between'
         }}
       >
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-          <ShieldCheckmark20Regular style={{ color: tokens.colorBrandForeground1 }} />
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+          <img
+            src="/logo.png"
+            alt="Demo-Factory logo"
+            width={28}
+            height={28}
+            style={{ display: 'block', borderRadius: 6 }}
+          />
           <Text weight="bold" size={400}>
             Demo-Factory
           </Text>

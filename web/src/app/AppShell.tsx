@@ -8,6 +8,7 @@ import {
   DialogContent,
   DialogSurface,
   DialogTitle,
+  Divider,
   Dropdown,
   FluentProvider,
   Input,
@@ -18,7 +19,11 @@ import {
   MenuPopover,
   MenuTrigger,
   Option,
+  Popover,
+  PopoverSurface,
+  PopoverTrigger,
   Text,
+  Tooltip,
   tokens
 } from '@fluentui/react-components';
 import {
@@ -26,6 +31,7 @@ import {
   Bot20Regular,
   BranchFork20Regular,
   AddCircle20Regular,
+  ChevronDown16Regular,
   DocumentText20Regular,
   Globe20Regular,
   History20Regular,
@@ -173,6 +179,7 @@ const AuthenticatedWorkspace: React.FC<{
 
   const [navCollapsed, setNavCollapsed] = useState(false);
   const [searchOpen, setSearchOpen] = useState(false);
+  const [statusMenuOpen, setStatusMenuOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
   const [selectedRepoId, setSelectedRepoId] = useState<string>('');
 
@@ -229,6 +236,29 @@ const AuthenticatedWorkspace: React.FC<{
 
   const stoppedRepos = repos.filter(r => r.lineStatus === 'LineStopped');
   const factoryStatus = statusQuery.data?.status ?? 'Running';
+  const isLiveGitHub = statusQuery.data?.sandboxMode === false;
+
+  const statusDotColor =
+    factoryStatus === 'Degraded'
+      ? '#ef4444'
+      : factoryStatus === 'Paused' || !connected || !isLiveGitHub
+      ? '#f59e0b'
+      : '#10b981';
+
+  const pipelineTooltipText =
+    factoryStatus === 'Paused'
+      ? 'Global pause is active (or GitHub OAuth reconnection is needed). No new issues are dispatched to Copilot and auto-merge is held.'
+      : factoryStatus === 'Degraded'
+      ? 'Stop-the-Line is active on at least one repository because a main-branch check failed. Automated recovery is running.'
+      : 'Autonomous scheduler and 30-second PR reconciler are actively dispatching work items and evaluating review gates.';
+
+  const streamTooltipText = connected
+    ? 'Connected via SignalR WebSocket (/hubs/factory). Board cards, sessions, approvals, and gate checks push in real time.'
+    : 'WebSocket stream is currently reconnecting; the UI is automatically refreshing state via HTTP polling.';
+
+  const modeTooltipText = isLiveGitHub
+    ? 'Connected to live GitHub repositories, webhooks, branch rulesets, Actions workflows, and copilot-swe-agent[bot]. Click to open readiness & policies.'
+    : 'Running in local simulated Sandbox Mode with synthetic GitHub responses and zero external repository writes. Click to configure Live GitHub mode.';
 
   const matchingNav = NAV_ITEMS.filter(n =>
     n.label.toLowerCase().includes(searchQuery.toLowerCase())
@@ -266,27 +296,36 @@ const AuthenticatedWorkspace: React.FC<{
             aria-label="Toggle navigation drawer"
             onClick={() => setNavCollapsed(v => !v)}
           />
-          <Text
-            size={400}
-            weight="bold"
-            style={{ cursor: 'pointer' }}
+          <div
+            role="button"
+            tabIndex={0}
+            aria-label="Go to Factory Overview"
             onClick={() => navigate('/')}
+            onKeyDown={e => {
+              if (e.key === 'Enter' || e.key === ' ') {
+                e.preventDefault();
+                navigate('/');
+              }
+            }}
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: 10,
+              cursor: 'pointer',
+              userSelect: 'none'
+            }}
           >
-            Demo-Factory
-          </Text>
-          <StatusPill status={factoryStatus} />
-          <Badge appearance="outline" color={connected ? 'success' : 'informative'}>
-            {connected ? 'Live' : 'Polling'}
-          </Badge>
-          <Badge
-            appearance="tint"
-            color={statusQuery.data?.sandboxMode === false ? 'brand' : 'warning'}
-            style={{ cursor: 'pointer' }}
-            title="Click to configure Sandbox vs Live GitHub execution mode"
-            onClick={() => navigate('/policies')}
-          >
-            {statusQuery.data?.sandboxMode === false ? 'Live GitHub' : 'Sandbox Mode'}
-          </Badge>
+            <img
+              src="/logo.png"
+              alt="Demo-Factory logo"
+              width={30}
+              height={30}
+              style={{ display: 'block', borderRadius: 7 }}
+            />
+            <Text size={400} weight="bold">
+              Demo-Factory
+            </Text>
+          </div>
 
           {repos.length > 0 && (
             <Dropdown
@@ -312,6 +351,101 @@ const AuthenticatedWorkspace: React.FC<{
           >
             Search (Ctrl+K)
           </Button>
+
+          <Popover
+            open={statusMenuOpen}
+            onOpenChange={(_, data) => setStatusMenuOpen(data.open)}
+            positioning="below-end"
+          >
+            <PopoverTrigger disableButtonEnhancement>
+              <Button
+                size="small"
+                appearance="outline"
+                aria-label="System status details"
+                iconPosition="after"
+                icon={<ChevronDown16Regular />}
+              >
+                <span style={{ display: 'inline-flex', alignItems: 'center', gap: 7 }}>
+                  <span
+                    aria-hidden="true"
+                    style={{
+                      width: 8,
+                      height: 8,
+                      borderRadius: '50%',
+                      backgroundColor: statusDotColor,
+                      boxShadow: `0 0 0 2px ${statusDotColor}33`
+                    }}
+                  />
+                  <span>Status: {factoryStatus}</span>
+                </span>
+              </Button>
+            </PopoverTrigger>
+            <PopoverSurface style={{ width: 310, padding: 14 }}>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+                <div>
+                  <Text size={300} weight="semibold" block>
+                    System &amp; Connection Status
+                  </Text>
+                  <Text size={100} style={{ color: tokens.colorNeutralForeground3 }}>
+                    Hover over any status pill for an explanation
+                  </Text>
+                </div>
+                <Divider />
+
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
+                  <Text size={200} weight="medium">
+                    Factory Pipeline
+                  </Text>
+                  <Tooltip content={pipelineTooltipText} relationship="description" withArrow positioning="before">
+                    <span tabIndex={0} style={{ display: 'inline-flex', cursor: 'help' }}>
+                      <StatusPill status={factoryStatus} />
+                    </span>
+                  </Tooltip>
+                </div>
+
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
+                  <Text size={200} weight="medium">
+                    Realtime Updates
+                  </Text>
+                  <Tooltip content={streamTooltipText} relationship="description" withArrow positioning="before">
+                    <span tabIndex={0} style={{ display: 'inline-flex', cursor: 'help' }}>
+                      <Badge appearance="outline" color={connected ? 'success' : 'informative'}>
+                        {connected ? 'Live' : 'Polling'}
+                      </Badge>
+                    </span>
+                  </Tooltip>
+                </div>
+
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
+                  <Text size={200} weight="medium">
+                    Execution Mode
+                  </Text>
+                  <Tooltip content={modeTooltipText} relationship="description" withArrow positioning="before">
+                    <span
+                      role="button"
+                      tabIndex={0}
+                      onClick={() => {
+                        setStatusMenuOpen(false);
+                        navigate('/policies');
+                      }}
+                      onKeyDown={e => {
+                        if (e.key === 'Enter' || e.key === ' ') {
+                          e.preventDefault();
+                          setStatusMenuOpen(false);
+                          navigate('/policies');
+                        }
+                      }}
+                      style={{ display: 'inline-flex', cursor: 'pointer' }}
+                    >
+                      <Badge appearance="tint" color={isLiveGitHub ? 'brand' : 'warning'}>
+                        {isLiveGitHub ? 'Live GitHub' : 'Sandbox Mode'}
+                      </Badge>
+                    </span>
+                  </Tooltip>
+                </div>
+              </div>
+            </PopoverSurface>
+          </Popover>
 
           <Button
             size="small"
