@@ -22,13 +22,27 @@ import { useMutation, useQueryClient } from '@tanstack/react-query';
 
 export const StatusPill: React.FC<{ status: string }> = ({ status }) => {
   const color =
-    status === 'Running' || status === 'Merged' || status === 'Done' || status === 'Pass' || status === 'Applied' || status === 'Completed'
+    status === 'Running' ||
+    status === 'Live' ||
+    status === 'Merged' ||
+    status === 'Done' ||
+    status === 'Pass' ||
+    status === 'Applied' ||
+    status === 'Completed'
       ? 'success'
       : status === 'Blocked' || status === 'Failed' || status === 'LineStopped' || status === 'Paused'
       ? 'danger'
-      : status === 'AwaitingApproval' || status === 'Degraded' || status === 'NeedsClarification'
+      : status === 'AwaitingApproval' ||
+        status === 'Degraded' ||
+        status === 'NeedsClarification' ||
+        status === 'Sandbox Mode' ||
+        status === 'Polling'
       ? 'warning'
-      : status === 'Implementing' || status === 'Validating' || status === 'Fixing' || status === 'InProgress'
+      : status === 'Implementing' ||
+        status === 'Validating' ||
+        status === 'Fixing' ||
+        status === 'InProgress' ||
+        status === 'Live GitHub'
       ? 'brand'
       : 'informative';
 

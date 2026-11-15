@@ -1,7 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import {
   Avatar,
-  Badge,
   Button,
   Dialog,
   DialogBody,
@@ -409,9 +408,7 @@ const AuthenticatedWorkspace: React.FC<{
                   </Text>
                   <Tooltip content={streamTooltipText} relationship="description" withArrow positioning="before">
                     <span tabIndex={0} style={{ display: 'inline-flex', cursor: 'help' }}>
-                      <Badge appearance="outline" color={connected ? 'success' : 'informative'}>
-                        {connected ? 'Live' : 'Polling'}
-                      </Badge>
+                      <StatusPill status={connected ? 'Live' : 'Polling'} />
                     </span>
                   </Tooltip>
                 </div>
@@ -437,9 +434,7 @@ const AuthenticatedWorkspace: React.FC<{
                       }}
                       style={{ display: 'inline-flex', cursor: 'pointer' }}
                     >
-                      <Badge appearance="tint" color={isLiveGitHub ? 'brand' : 'warning'}>
-                        {isLiveGitHub ? 'Live GitHub' : 'Sandbox Mode'}
-                      </Badge>
+                      <StatusPill status={isLiveGitHub ? 'Live GitHub' : 'Sandbox Mode'} />
                     </span>
                   </Tooltip>
                 </div>
