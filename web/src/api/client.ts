@@ -217,7 +217,8 @@ export const api = {
   resumeFactory: (repoId?: string) =>
     request(`/api/factory:resume${repoId ? `?repo=${repoId}` : ''}`, { method: 'POST' }),
 
-  getMetrics: () => request<any>('/api/metrics'),
+  getMetrics: (repoId?: string) =>
+    request<any>(`/api/metrics${repoId ? `?repoId=${encodeURIComponent(repoId)}` : ''}`),
   getApprovals: () => request<{ workItemApprovals: any[]; changeProposals: any[] }>('/api/approvals'),
   getTemplates: () => request<any[]>('/api/templates'),
   getProjects: () => request<ProjectSummary[]>('/api/projects'),

@@ -14,6 +14,7 @@ import {
   Bar,
   BarChart,
   CartesianGrid,
+  Legend,
   Line,
   LineChart,
   ResponsiveContainer,
@@ -28,7 +29,7 @@ export const OverviewPage: React.FC<{ selectedRepoId?: string }> = () => {
   const navigate = useNavigate();
   const qc = useQueryClient();
 
-  const metricsQuery = useQuery({ queryKey: ['metrics'], queryFn: api.getMetrics });
+  const metricsQuery = useQuery({ queryKey: ['metrics'], queryFn: () => api.getMetrics() });
   const approvalsQuery = useQuery({ queryKey: ['approvals'], queryFn: api.getApprovals });
   const reposQuery = useQuery({ queryKey: ['repos'], queryFn: api.getRepos });
 
@@ -94,10 +95,28 @@ export const OverviewPage: React.FC<{ selectedRepoId?: string }> = () => {
           gap: 'var(--df-gap)'
         }}
       >
-        <KpiCard label="Throughput" value={`${m.throughputPerDay}/day`} subtitle="Merged PRs per day" accent="success" />
-        <KpiCard label="Median Lead Time" value={`${m.medianLeadTimeMinutes}m`} subtitle="Ready → Done" />
-        <KpiCard label="First-Pass Gate Rate" value={`${m.firstPassGateRatePercent}%`} subtitle="Green on Round 1" accent="success" />
-        <KpiCard label="Avg Review Rounds" value={m.averageReviewRounds} subtitle="Max 3 before Blocked" />
+        <KpiCard
+          label="Throughput"
+          value={`${m.throughputPerDay}/day`}
+          subtitle={`${m.totalMergedCount ?? 0} merged PR(s) over ${m.activeCalendarDays ?? 1} active day(s)`}
+          accent="success"
+        />
+        <KpiCard
+          label="Median Lead Time"
+          value={m.medianLeadTimeMinutes != null ? `${m.medianLeadTimeMinutes}m` : '—'}
+          subtitle={m.medianLeadTimeMinutes != null ? 'Ready → Merged' : 'No merged PRs yet'}
+        />
+        <KpiCard
+          label="First-Pass Gate Rate"
+          value={m.firstPassGateRatePercent != null ? `${m.firstPassGateRatePercent}%` : '—'}
+          subtitle={m.firstPassGateRatePercent != null ? 'Green on Round 1' : 'No merged PRs yet'}
+          accent="success"
+        />
+        <KpiCard
+          label="Avg Review Rounds"
+          value={m.averageReviewRounds != null ? m.averageReviewRounds : '—'}
+          subtitle="Max 3 before Blocked"
+        />
         <KpiCard
           label="Blocked Items"
           value={m.blockedCount}
@@ -111,13 +130,17 @@ export const OverviewPage: React.FC<{ selectedRepoId?: string }> = () => {
         />
         <KpiCard
           label="Stop-the-Line MTTR"
-          value={`${m.mttrMinutes}m`}
-          subtitle={`${m.flakyTestCount} flaky check(s) recorded`}
+          value={m.mttrMinutes != null ? `${m.mttrMinutes}m` : '—'}
+          subtitle={`${m.lineStopIncidentCount ?? 0} incident(s) · ${m.flakyTestCount} flaky check(s)`}
         />
         <KpiCard
           label="Requirement Coverage"
-          value={`${m.requirementCoveragePercent}%`}
-          subtitle="Requirements with passing ATs"
+          value={m.requirementCoveragePercent != null ? `${m.requirementCoveragePercent}%` : '—'}
+          subtitle={
+            m.requirementsTotal != null && m.requirementsTotal > 0
+              ? `${m.requirementsPassing ?? 0} / ${m.requirementsTotal} requirements done`
+              : 'No requirements tracked yet'
+          }
           accent="success"
         />
       </div>
@@ -283,32 +306,57 @@ export const OverviewPage: React.FC<{ selectedRepoId?: string }> = () => {
         </Card>
       </div>
 
-      {/* 30-day Trend Charts + Live Activity Feed */}
+      {/* 14-day Real Trend Charts + Live Activity Feed */}
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(360px, 1fr))', gap: 16 }}>
         <Card style={{ padding: 16 }}>
-          <Text size={400} weight="semibold" block style={{ marginBottom: 12 }}>
-            Throughput & Review Rounds Trend
-          </Text>
+          <div style={{ marginBottom: 12 }}>
+            <Text size={400} weight="semibold" block>
+              Throughput &amp; Review Rounds Trend (Last 14 Days)
+            </Text>
+            <Text size={200} style={{ color: tokens.colorNeutralForeground3 }}>
+              Live counts from merged pull requests, Copilot agent sessions, and review rounds (UTC days)
+            </Text>
+          </div>
           <div style={{ width: '100%', height: 220 }}>
             <ResponsiveContainer>
               <BarChart data={m.trend30Days}>
                 <CartesianGrid strokeDasharray="3 3" stroke={tokens.colorNeutralStroke2} />
                 <XAxis dataKey="date" tick={{ fontSize: 11 }} />
-                <YAxis tick={{ fontSize: 11 }} />
+                <YAxis allowDecimals={false} tick={{ fontSize: 11 }} />
                 <Tooltip />
+                <Legend wrapperStyle={{ fontSize: 12 }} />
                 <Bar dataKey="merged" name="Merged PRs" fill="#2b82f0" radius={[4, 4, 0, 0]} />
+                <Bar dataKey="sessions" name="Copilot Sessions" fill="#8b5cf6" radius={[4, 4, 0, 0]} />
               </BarChart>
             </ResponsiveContainer>
           </div>
-          <div style={{ width: '100%', height: 160, marginTop: 12 }}>
+          <div style={{ width: '100%', height: 175, marginTop: 12 }}>
             <ResponsiveContainer>
               <LineChart data={m.trend30Days}>
                 <CartesianGrid strokeDasharray="3 3" stroke={tokens.colorNeutralStroke2} />
                 <XAxis dataKey="date" tick={{ fontSize: 11 }} />
-                <YAxis tick={{ fontSize: 11 }} />
+                <YAxis yAxisId="rounds" allowDecimals={true} domain={[0, 'auto']} tick={{ fontSize: 11 }} />
+                <YAxis yAxisId="lead" orientation="right" domain={[0, 'auto']} tick={{ fontSize: 11 }} unit="m" />
                 <Tooltip />
-                <Line type="monotone" dataKey="costUsd" name="Avg Cost ($)" stroke="#4b95f4" strokeWidth={2} />
-                <Line type="monotone" dataKey="avgRounds" name="Avg Rounds" stroke="#10b981" strokeWidth={2} />
+                <Legend wrapperStyle={{ fontSize: 12 }} />
+                <Line
+                  yAxisId="rounds"
+                  type="monotone"
+                  dataKey="avgRounds"
+                  name="Avg Review Rounds"
+                  stroke="#10b981"
+                  strokeWidth={2}
+                  connectNulls
+                />
+                <Line
+                  yAxisId="lead"
+                  type="monotone"
+                  dataKey="avgLeadMinutes"
+                  name="Avg Lead Time (min)"
+                  stroke="#f59e0b"
+                  strokeWidth={2}
+                  connectNulls
+                />
               </LineChart>
             </ResponsiveContainer>
           </div>

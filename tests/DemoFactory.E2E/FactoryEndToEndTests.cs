@@ -883,6 +883,23 @@ public sealed class FactoryEndToEndTests : IAsyncLifetime
                 Assert.Equal(WorkItemStateKind.Implementing, wi2.State);
                 Assert.Equal(BoardStatus.InProgress, wi2.BoardStatus);
             }
+
+            // Verify /api/metrics reports strictly real SQL counts (0 on inactive prior days, never synthetic modulo values)
+            using var metricsClient = reconcileFactory.CreateClient();
+            var metrics = await metricsClient.GetFromJsonAsync<JsonElement>("/api/metrics");
+            Assert.Equal(1, metrics.GetProperty("totalMergedCount").GetInt32());
+            Assert.Equal(JsonValueKind.Null, metrics.GetProperty("mttrMinutes").ValueKind);
+
+            var trend = metrics.GetProperty("trend30Days").EnumerateArray().ToList();
+            Assert.Equal(14, trend.Count);
+            for (var i = 0; i < 13; i++)
+            {
+                Assert.Equal(0, trend[i].GetProperty("merged").GetInt32());
+                Assert.Equal(0, trend[i].GetProperty("sessions").GetInt32());
+                Assert.Equal(JsonValueKind.Null, trend[i].GetProperty("avgRounds").ValueKind);
+            }
+            Assert.Equal(1, trend[13].GetProperty("merged").GetInt32());
+            Assert.Equal(1.0, trend[13].GetProperty("avgRounds").GetDouble());
         }
         finally
         {

@@ -1343,59 +1343,137 @@ public static class OperationsAndGovernanceEndpoints
             return Results.Ok(new { scope = "global", paused = false });
         }).RequireAuthorization(FactoryRoles.AdminPolicy);
 
-        // KPIs & Trend Metrics (§13, §14.2 Screen 1)
-        app.MapGet("/api/metrics", async (IDbContextFactory<DemoFactoryDbContext> dbFactory, CancellationToken ct) =>
+        // KPIs & Trend Metrics (§13, §14.2 Screen 1) — 100% real database telemetry (zero synthetic fallbacks)
+        app.MapGet("/api/metrics", async (Guid? repoId, IDbContextFactory<DemoFactoryDbContext> dbFactory, CancellationToken ct) =>
         {
             await using var db = await dbFactory.CreateDbContextAsync(ct);
-            var workItems = await db.WorkItems.ToListAsync(ct);
-            var sessions = await db.AgentSessions.ToListAsync(ct);
-            var gates = await db.GateEvaluations.ToListAsync(ct);
-            var reqs = await db.Requirements.ToListAsync(ct);
-            var lines = await db.LineStates.ToListAsync(ct);
+
+            Guid? projectId = null;
+            if (repoId.HasValue)
+            {
+                var targetRepo = await db.Repositories.FirstOrDefaultAsync(r => r.Id == repoId.Value, ct);
+                projectId = targetRepo?.ProjectId;
+            }
+
+            var workItemsQuery = db.WorkItems.Where(w => w.State != WorkItemStateKind.Cancelled);
+            var sessionsQuery = db.AgentSessions.AsQueryable();
+            var gatesQuery = db.GateEvaluations.AsQueryable();
+            var roundsQuery = db.ReviewRounds.AsQueryable();
+            var reqsQuery = db.Requirements.AsQueryable();
+            var linesQuery = db.LineStates.AsQueryable();
+
+            if (repoId.HasValue)
+            {
+                workItemsQuery = workItemsQuery.Where(w => w.RepoId == repoId.Value);
+                sessionsQuery = sessionsQuery.Where(s => s.RepoId == repoId.Value);
+                linesQuery = linesQuery.Where(l => l.RepoId == repoId.Value);
+                if (projectId.HasValue)
+                    reqsQuery = reqsQuery.Where(r => r.ProjectId == projectId.Value);
+            }
+
+            var workItems = await workItemsQuery.ToListAsync(ct);
+            var workItemIds = workItems.Select(w => w.Id).ToHashSet();
+            var sessions = await sessionsQuery.ToListAsync(ct);
+            var allGates = await gatesQuery.ToListAsync(ct);
+            var allRounds = await roundsQuery.ToListAsync(ct);
+            var gates = repoId.HasValue ? allGates.Where(g => workItemIds.Contains(g.WorkItemId)).ToList() : allGates;
+            var reviewRounds = repoId.HasValue ? allRounds.Where(r => workItemIds.Contains(r.WorkItemId)).ToList() : allRounds;
+            var reqs = await reqsQuery.ToListAsync(ct);
+            var lines = await linesQuery.ToListAsync(ct);
             var audits = await db.AuditEvents.OrderByDescending(a => a.Timestamp).Take(20).ToListAsync(ct);
 
             var merged = workItems.Where(w => w.State == WorkItemStateKind.Merged).ToList();
+            var fixSessionWorkItemIds = sessions
+                .Where(s => s.Mode == AgentSessionMode.Fix)
+                .Select(s => s.WorkItemId)
+                .ToHashSet();
+
             var leadTimesMinutes = merged
-                .Where(w => w.ReadyAt.HasValue && w.MergedAt.HasValue)
-                .Select(w => Math.Max(1.0, (w.MergedAt!.Value - w.ReadyAt!.Value).TotalMinutes))
+                .Where(w => w.MergedAt.HasValue)
+                .Select(w => Math.Max(1.0, (w.MergedAt!.Value - (w.ReadyAt ?? w.CreatedAt)).TotalMinutes))
                 .OrderBy(x => x)
                 .ToList();
 
-            var medianLeadMinutes = leadTimesMinutes.Count == 0
-                ? 28.0
-                : leadTimesMinutes[leadTimesMinutes.Count / 2];
+            double? medianLeadMinutes = leadTimesMinutes.Count == 0
+                ? null
+                : leadTimesMinutes.Count % 2 == 1
+                    ? Math.Round(leadTimesMinutes[leadTimesMinutes.Count / 2], 1)
+                    : Math.Round((leadTimesMinutes[(leadTimesMinutes.Count / 2) - 1] + leadTimesMinutes[leadTimesMinutes.Count / 2]) / 2.0, 1);
 
-            var firstPassCount = merged.Count(w => w.CurrentRound <= 1);
-            var firstPassRate = merged.Count == 0 ? 0.80 : Math.Round((double)firstPassCount / merged.Count * 100.0, 1);
-            var avgRounds = workItems.Count == 0 ? 1.2 : Math.Round(workItems.Where(w => w.CurrentRound > 0).Select(w => (double)w.CurrentRound).DefaultIfEmpty(1.2).Average(), 2);
+            var firstPassCount = merged.Count(w => Math.Max(1, w.CurrentRound) <= 1 && !fixSessionWorkItemIds.Contains(w.Id));
+            double? firstPassRate = merged.Count == 0
+                ? null
+                : Math.Round((double)firstPassCount / merged.Count * 100.0, 1);
 
-            var todayStart = new DateTimeOffset(DateTimeOffset.UtcNow.Date, TimeSpan.Zero);
+            var evaluatedItems = workItems
+                .Where(w => w.CurrentRound > 0 || w.State == WorkItemStateKind.Merged)
+                .ToList();
+            double? avgRounds = evaluatedItems.Count == 0
+                ? null
+                : Math.Round(evaluatedItems.Average(w => (double)Math.Max(1, w.CurrentRound)), 2);
+
+            var utcToday = DateTimeOffset.UtcNow.UtcDateTime.Date;
+            var todayStart = new DateTimeOffset(utcToday, TimeSpan.Zero);
             var sessionsToday = sessions.Where(s => s.StartedAt >= todayStart).ToList();
             var spendToday = sessionsToday.Sum(s => s.EstimatedCostUsd);
 
             var reqPassing = reqs.Count(r => r.Status is RequirementCoverageStatus.TestsPassing or RequirementCoverageStatus.Done);
-            var reqCoveragePct = reqs.Count == 0 ? 100.0 : Math.Round((double)reqPassing / reqs.Count * 100.0, 1);
+            double? reqCoveragePct = reqs.Count == 0
+                ? null
+                : Math.Round((double)reqPassing / reqs.Count * 100.0, 1);
 
-            var mttrSeconds = lines.Where(l => l.LastRestoreDurationSeconds.HasValue).Select(l => (double)l.LastRestoreDurationSeconds!.Value).DefaultIfEmpty(420).Average();
+            var restoredDurations = lines
+                .Where(l => l.LastRestoreDurationSeconds.HasValue)
+                .Select(l => (double)l.LastRestoreDurationSeconds!.Value)
+                .ToList();
+            double? mttrMinutes = restoredDurations.Count == 0
+                ? null
+                : Math.Round(restoredDurations.Average() / 60.0, 1);
             var flakyTotal = lines.Sum(l => l.FlakyTestCount);
+
+            var activeCalendarDays = workItems.Count == 0
+                ? 1.0
+                : Math.Clamp((utcToday - workItems.Min(w => w.CreatedAt.UtcDateTime.Date)).TotalDays + 1.0, 1.0, 30.0);
+            var throughputPerDay = merged.Count == 0
+                ? 0.0
+                : Math.Round(merged.Count / activeCalendarDays, 1);
 
             var trend30Days = Enumerable.Range(0, 14).Select(offset =>
             {
-                var day = DateTimeOffset.UtcNow.Date.AddDays(-(13 - offset));
-                var dayMerged = merged.Count(m => m.MergedAt?.Date == day);
+                var day = utcToday.AddDays(-(13 - offset));
+                var dayMergedItems = merged.Where(m => m.MergedAt?.UtcDateTime.Date == day).ToList();
+                var daySessions = sessions.Where(s => s.StartedAt.UtcDateTime.Date == day).ToList();
+                var dayRoundEntities = reviewRounds.Where(r => r.CreatedAt.UtcDateTime.Date == day).ToList();
+
+                double? dayAvgRounds = dayMergedItems.Count > 0
+                    ? Math.Round(dayMergedItems.Average(m => (double)Math.Max(1, m.CurrentRound)), 2)
+                    : dayRoundEntities.Count > 0
+                        ? Math.Round(dayRoundEntities.GroupBy(r => r.WorkItemId).Average(g => (double)g.Max(x => x.Round)), 2)
+                        : null;
+
+                double? dayAvgLeadMinutes = dayMergedItems.Count == 0
+                    ? null
+                    : Math.Round(
+                        dayMergedItems.Average(m => Math.Max(1.0, (m.MergedAt!.Value - (m.ReadyAt ?? m.CreatedAt)).TotalMinutes)),
+                        1);
+
                 return new
                 {
                     date = day.ToString("MMM dd"),
-                    merged = dayMerged > 0 ? dayMerged : (offset % 3) + 1,
-                    avgRounds = Math.Round(1.1 + (offset % 4) * 0.2, 2),
-                    costUsd = Math.Round(0.45m + (offset % 3) * 0.22m, 2)
+                    merged = dayMergedItems.Count,
+                    sessions = daySessions.Count,
+                    avgRounds = dayAvgRounds,
+                    avgLeadMinutes = dayAvgLeadMinutes,
+                    costUsd = Math.Round(daySessions.Sum(s => s.EstimatedCostUsd), 2)
                 };
             }).ToList();
 
             return Results.Ok(new
             {
-                throughputPerDay = Math.Round(Math.Max(1.0, merged.Count / 4.0), 1),
-                medianLeadTimeMinutes = Math.Round(medianLeadMinutes, 1),
+                throughputPerDay,
+                totalMergedCount = merged.Count,
+                activeCalendarDays = (int)activeCalendarDays,
+                medianLeadTimeMinutes = medianLeadMinutes,
                 firstPassGateRatePercent = firstPassRate,
                 averageReviewRounds = avgRounds,
                 blockedCount = workItems.Count(w => w.BoardStatus == BoardStatus.Blocked),
@@ -1403,9 +1481,13 @@ public static class OperationsAndGovernanceEndpoints
                 dailySessionBudget = 40,
                 spendTodayUsd = spendToday,
                 dailySpendBudgetUsd = 25.0m,
-                mttrMinutes = Math.Round(mttrSeconds / 60.0, 1),
+                mttrMinutes,
+                lineStopIncidentCount = restoredDurations.Count,
                 flakyTestCount = flakyTotal,
                 requirementCoveragePercent = reqCoveragePct,
+                requirementsPassing = reqPassing,
+                requirementsTotal = reqs.Count,
+                gateEvaluationsCount = gates.Count,
                 trend30Days,
                 recentActivity = audits
             });
