@@ -109,7 +109,9 @@ public static class OperationsAndGovernanceEndpoints
             var repos = await db.Repositories.OrderBy(r => r.Name).ToListAsync(ct);
             var lineStates = await db.LineStates.ToDictionaryAsync(l => l.RepoId, ct);
             var workItems = await db.WorkItems.ToListAsync(ct);
-            var inbox = await db.InboxItems.Where(i => i.State == InboxItemState.New).ToListAsync(ct);
+            var inbox = await db.InboxItems
+                .Where(i => i.State == InboxItemState.New && i.FeatureId == null)
+                .ToListAsync(ct);
 
             return Results.Ok(repos.Select(r =>
             {

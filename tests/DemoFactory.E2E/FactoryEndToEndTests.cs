@@ -170,14 +170,44 @@ public sealed class FactoryEndToEndTests : IAsyncLifetime
         var contosoProjId = projects.EnumerateArray().First(p => p.GetProperty("slug").GetString() == "contoso-smart-grid").GetProperty("id").GetGuid();
 
         var inbox = await _client.GetFromJsonAsync<JsonElement>($"/api/projects/{contosoProjId}/inbox");
-        Assert.Contains(inbox.EnumerateArray(), i => i.GetProperty("issueNumber").GetInt32() == 77);
+        Assert.Contains(inbox.EnumerateArray(), i => i.GetProperty("issueNumber").GetInt32() == 77 && !string.IsNullOrWhiteSpace(i.GetProperty("suggestedGroup").GetString()));
+        Assert.DoesNotContain(inbox.EnumerateArray(), i => i.GetProperty("state").GetString() == "Planned");
 
-        // Turn inbox issue #77 into a vetted feature draft (§5.6, AC 27)
+        // Turn inbox issue #77 into a vetted feature draft (§5.6, AC 27) -> #77 must immediately disappear from Issue Inbox!
         var fromIssuesResp = await _client.PostAsJsonAsync($"/api/projects/{contosoProjId}/features:from-issues", new
         {
             issueNumbers = new[] { 77 }
         });
         Assert.Equal(HttpStatusCode.Created, fromIssuesResp.StatusCode);
+
+        var inboxAfterSpec = await _client.GetFromJsonAsync<JsonElement>($"/api/projects/{contosoProjId}/inbox");
+        Assert.DoesNotContain(inboxAfterSpec.EnumerateArray(), i => i.GetProperty("issueNumber").GetInt32() == 77);
+
+        // Even when the repository owner (@azureholic) manually creates an issue on GitHub and manually applies 'factory',
+        // it must NOT be treated as a vetted board WorkItem — it stays in Issue Inbox until synthesized into a Feature spec!
+        var manualOwnerLabeledPayload = JsonSerializer.Serialize(new
+        {
+            action = "labeled",
+            sender = new { login = "azureholic" },
+            repository = new { full_name = "azureholic/contoso-smart-grid" },
+            issue = new
+            {
+                number = 78,
+                title = "Beatbox API fails to build locally",
+                body = "Running dotnet run exits with npm error.",
+                user = new { login = "azureholic" },
+                labels = new[] { new { name = "bug" }, new { name = "factory" } }
+            }
+        });
+        var manualResp = await SendSignedWebhookAsync("issues", Guid.NewGuid().ToString(), manualOwnerLabeledPayload);
+        Assert.Equal(HttpStatusCode.Accepted, manualResp.StatusCode);
+
+        var contosoRepoId = projects.EnumerateArray().First(p => p.GetProperty("slug").GetString() == "contoso-smart-grid").GetProperty("repoId").GetGuid();
+        var contosoBoard = await _client.GetFromJsonAsync<JsonElement>($"/api/repos/{contosoRepoId}/board");
+        Assert.DoesNotContain(contosoBoard.GetProperty("cards").EnumerateArray(), c => c.GetProperty("issueNumber").GetInt32() == 78);
+
+        var inboxWith78 = await _client.GetFromJsonAsync<JsonElement>($"/api/projects/{contosoProjId}/inbox");
+        Assert.Contains(inboxWith78.EnumerateArray(), i => i.GetProperty("issueNumber").GetInt32() == 78 && i.GetProperty("ownerAttemptedDirectWorkLabel").GetBoolean());
 
         // Fork PR from untrusted user -> ignored, gets no preview and no orchestration (§18 AC 17)
         var forkPrPayload = JsonSerializer.Serialize(new

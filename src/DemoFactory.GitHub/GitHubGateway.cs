@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Net.Http.Headers;
 using System.Net.Http.Json;
 using System.Text.Json;
@@ -85,7 +86,9 @@ public interface IGitHubGateway
     Task<bool> TrySquashMergePullRequestAsync(string owner, string repo, int prNumber, string expectedHeadSha, CancellationToken ct = default);
     Task<(string ProjectId, int ProjectNumber)> CopyProjectBoardAsync(string owner, string repo, string title, CancellationToken ct = default);
     Task<CreatedIssueRef> CreateIssueAsync(string owner, string repo, string title, string body, IReadOnlyList<string> labels, CancellationToken ct = default);
+    bool IsRecentlyFactoryCreatedIssue(string owner, string repo, int issueNumber);
     Task UpdateIssueAsync(string owner, string repo, int issueNumber, string title, string body, CancellationToken ct = default);
+    Task RemoveIssueLabelAsync(string owner, string repo, int issueNumber, string labelName, CancellationToken ct = default);
     Task UnlockConversationAsync(string owner, string repo, int issueOrPrNumber, CancellationToken ct = default);
     Task AddBlockedByDependencyAsync(string dependentIssueNodeId, string blockerIssueNodeId, CancellationToken ct = default);
     Task<string> AddIssueToProjectBoardAsync(string projectId, string issueNodeId, BoardStatus status, PriorityLevel priority, ItemSize size, string factoryState, string model, string? featureSlug, CancellationToken ct = default);
@@ -120,6 +123,7 @@ public sealed class GitHubGateway(
     ILogger<GitHubGateway> logger) : IGitHubGateway
 {
     private readonly SemaphoreSlim _writePacer = new(1, 1);
+    private readonly ConcurrentDictionary<string, DateTimeOffset> _factoryCreatedIssues = new(StringComparer.OrdinalIgnoreCase);
     private DateTimeOffset _lastWriteAt = DateTimeOffset.MinValue;
     private int _sandboxNextIssueNumber = 20;
     private int _sandboxNextPrNumber = 200;
@@ -1092,6 +1096,7 @@ public sealed class GitHubGateway(
             var num = Interlocked.Increment(ref _sandboxNextIssueNumber);
             var nodeId = $"I_sandbox_{repo}_{num}";
             var url = $"https://github.com/{owner}/{repo}/issues/{num}";
+            _factoryCreatedIssues[$"{owner}/{repo}#{num}"] = DateTimeOffset.UtcNow;
             await auditLogger.RecordAsync(envOptions.Value.OwnerLogin, "IssueCreated", "Issue", $"{owner}/{repo}#{num}", after: new { title, labels }, issueNumber: num, ct: ct);
             return new CreatedIssueRef(num, nodeId, url);
         }
@@ -1107,7 +1112,8 @@ public sealed class GitHubGateway(
         }, ct);
 
         var createdNumber = createdDoc.RootElement.GetProperty("number").GetInt32();
-        var createdNodeId = createdDoc.RootElement.GetProperty("node_id").GetString() ?? $"I_{repo}_{createdNumber}";
+        _factoryCreatedIssues[$"{owner}/{repo}#{createdNumber}"] = DateTimeOffset.UtcNow;
+        var createdNodeId = createdDoc.RootElement.GetProperty("node_id").GetString() ?? $"I_factory_{repo}_{createdNumber}";
         var createdUrl = createdDoc.RootElement.TryGetProperty("html_url", out var hu)
             ? hu.GetString() ?? $"https://github.com/{owner}/{repo}/issues/{createdNumber}"
             : $"https://github.com/{owner}/{repo}/issues/{createdNumber}";
@@ -1123,6 +1129,17 @@ public sealed class GitHubGateway(
 
         await auditLogger.RecordAsync(envOptions.Value.OwnerLogin, "IssueCreated", "Issue", $"{owner}/{repo}#{createdNumber}", after: new { title, labels }, issueNumber: createdNumber, ct: ct);
         return new CreatedIssueRef(createdNumber, createdNodeId, createdUrl);
+    }
+
+    public bool IsRecentlyFactoryCreatedIssue(string owner, string repo, int issueNumber)
+    {
+        if (_factoryCreatedIssues.TryGetValue($"{owner}/{repo}#{issueNumber}", out var ts))
+        {
+            if (DateTimeOffset.UtcNow - ts <= TimeSpan.FromMinutes(15))
+                return true;
+            _factoryCreatedIssues.TryRemove($"{owner}/{repo}#{issueNumber}", out _);
+        }
+        return false;
     }
 
     public async Task UpdateIssueAsync(
@@ -1154,6 +1171,27 @@ public sealed class GitHubGateway(
             after: new { title },
             issueNumber: issueNumber,
             ct: ct);
+    }
+
+    public async Task RemoveIssueLabelAsync(
+        string owner,
+        string repo,
+        int issueNumber,
+        string labelName,
+        CancellationToken ct = default)
+    {
+        await EnsureRepoAllowlistedAsync(owner, repo, ct);
+        if (IsSandbox || string.IsNullOrWhiteSpace(labelName))
+            return;
+
+        await PaceWriteAsync(ct);
+        using var http = await CreateDelegatedHttpAsync(ct);
+        await TrySendGitHubRestAsync(
+            http,
+            HttpMethod.Delete,
+            $"/repos/{owner}/{repo}/issues/{issueNumber}/labels/{Uri.EscapeDataString(labelName)}",
+            null,
+            ct);
     }
 
     public async Task UnlockConversationAsync(string owner, string repo, int issueOrPrNumber, CancellationToken ct = default)

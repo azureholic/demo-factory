@@ -73,7 +73,7 @@ public static class ProjectAndFeatureEndpoints
             var projects = await db.Projects.OrderByDescending(p => p.CreatedAt).ToListAsync(ct);
             var repos = await db.Repositories.ToListAsync(ct);
             var inboxCounts = await db.InboxItems
-                .Where(i => i.State == InboxItemState.New)
+                .Where(i => i.State == InboxItemState.New && i.FeatureId == null)
                 .GroupBy(i => i.ProjectId)
                 .Select(g => new { ProjectId = g.Key, Count = g.Count() })
                 .ToDictionaryAsync(x => x.ProjectId, x => x.Count, ct);
@@ -372,6 +372,17 @@ public static class ProjectAndFeatureEndpoints
             };
 
             db.FeatureSpecs.Add(feature);
+            if (req.SourceIssueNumbers is { Count: > 0 })
+            {
+                var linkedInbox = await db.InboxItems
+                    .Where(i => i.ProjectId == id && req.SourceIssueNumbers.Contains(i.IssueNumber))
+                    .ToListAsync(ct);
+                foreach (var src in linkedInbox)
+                {
+                    src.FeatureId = feature.Id;
+                    src.State = InboxItemState.Planned;
+                }
+            }
             await db.SaveChangesAsync(ct);
             return Results.Created($"/api/features/{feature.Id}/status", new
             {
@@ -504,27 +515,111 @@ public static class ProjectAndFeatureEndpoints
         // §5.6 Issue Inbox & Create Feature from Issues
         app.MapGet("/api/projects/{id:guid}/inbox", async (
             Guid id,
+            IDbContextFactory<DemoFactoryDbContext> dbFactory,
+            CancellationToken ct) =>
+        {
+            await using var db = await dbFactory.CreateDbContextAsync(ct);
+            var candidates = await db.InboxItems
+                .Where(i => i.ProjectId == id && i.State == InboxItemState.New && i.FeatureId == null)
+                .OrderByDescending(i => i.ReactionsCount)
+                .ThenByDescending(i => i.CreatedAt)
+                .ToListAsync(ct);
+
+            if (candidates.Count == 0)
+                return Results.Ok(Array.Empty<object>());
+
+            // Reconcile any items that were already converted into a FeatureSpec
+            var activeFeatures = await db.FeatureSpecs
+                .Where(f => f.ProjectId == id && f.State != FeatureSpecState.Withdrawn)
+                .Select(f => new { f.Id, f.SourceIssueNumbersJson })
+                .ToListAsync(ct);
+
+            var specConvertedMap = new Dictionary<int, Guid>();
+            foreach (var f in activeFeatures)
+            {
+                var nums = string.IsNullOrWhiteSpace(f.SourceIssueNumbersJson)
+                    ? []
+                    : JsonSerializer.Deserialize<List<int>>(f.SourceIssueNumbersJson, JsonOpts) ?? [];
+                foreach (var n in nums)
+                    specConvertedMap.TryAdd(n, f.Id);
+            }
+
+            var dirty = false;
+            var visible = new List<InboxItemEntity>(candidates.Count);
+            foreach (var item in candidates)
+            {
+                if (specConvertedMap.TryGetValue(item.IssueNumber, out var featId))
+                {
+                    item.FeatureId = featId;
+                    item.State = InboxItemState.Planned;
+                    dirty = true;
+                    continue;
+                }
+
+                visible.Add(item);
+            }
+
+            // Fast (<1ms) deterministic grouping so GET /inbox never blocks on a live Foundry LLM call
+            var ungrouped = visible.Where(i => string.IsNullOrWhiteSpace(i.SuggestedGroup)).ToList();
+            if (ungrouped.Count > 0)
+            {
+                var fastGroups = ProjectManagerAgent.BuildDeterministicInboxGroups(
+                    ungrouped.Select(i => new UntrustedInboxIssue(i.IssueNumber, i.Author, i.Title, i.Body)).ToList());
+
+                foreach (var s in fastGroups.Suggestions)
+                {
+                    var match = ungrouped.FirstOrDefault(u => u.IssueNumber == s.IssueNumber);
+                    if (match is not null)
+                    {
+                        match.SuggestedGroup = s.SuggestedGroup;
+                        match.DuplicateOfIssueNumber = s.LikelyDuplicateOf;
+                        dirty = true;
+                    }
+                }
+            }
+
+            if (dirty)
+                await db.SaveChangesAsync(ct);
+
+            return Results.Ok(visible.Select(i => new
+            {
+                i.Id,
+                i.IssueNumber,
+                i.Title,
+                i.Body,
+                i.Author,
+                i.ReactionsCount,
+                labels = JsonSerializer.Deserialize<List<string>>(i.LabelsJson, JsonOpts) ?? [],
+                i.OwnerAttemptedDirectWorkLabel,
+                i.State,
+                i.SuggestedGroup,
+                i.DuplicateOfIssueNumber,
+                i.HtmlUrl,
+                i.CreatedAt,
+                linkedFeature = (object?)null
+            }));
+        }).RequireAuthorization(FactoryRoles.ViewerPolicy);
+
+        app.MapPost("/api/projects/{id:guid}/inbox:regroup", async (
+            Guid id,
             IProjectManagerAgent pmAgent,
             IDbContextFactory<DemoFactoryDbContext> dbFactory,
             CancellationToken ct) =>
         {
             await using var db = await dbFactory.CreateDbContextAsync(ct);
             var items = await db.InboxItems
-                .Where(i => i.ProjectId == id && i.State != InboxItemState.Dismissed)
-                .OrderByDescending(i => i.ReactionsCount)
-                .ThenByDescending(i => i.CreatedAt)
+                .Where(i => i.ProjectId == id && i.State == InboxItemState.New && i.FeatureId == null)
                 .ToListAsync(ct);
 
-            var ungrouped = items.Where(i => string.IsNullOrWhiteSpace(i.SuggestedGroup)).ToList();
-            if (ungrouped.Count > 0)
+            if (items.Count > 0)
             {
                 var grouped = await pmAgent.GroupInboxAsync(
-                    ungrouped.Select(i => new UntrustedInboxIssue(i.IssueNumber, i.Author, i.Title, i.Body)).ToList(), ct: ct);
+                    items.Select(i => new UntrustedInboxIssue(i.IssueNumber, i.Author, i.Title, i.Body)).ToList(), ct: ct);
 
                 foreach (var s in grouped.Suggestions)
                 {
-                    var match = ungrouped.FirstOrDefault(u => u.IssueNumber == s.IssueNumber);
-                    if (match is not null)
+                    var match = items.FirstOrDefault(u => u.IssueNumber == s.IssueNumber);
+                    if (match is not null && !string.IsNullOrWhiteSpace(s.SuggestedGroup))
                     {
                         match.SuggestedGroup = s.SuggestedGroup;
                         match.DuplicateOfIssueNumber = s.LikelyDuplicateOf;
@@ -533,30 +628,8 @@ public static class ProjectAndFeatureEndpoints
                 await db.SaveChangesAsync(ct);
             }
 
-            var features = await db.FeatureSpecs.Where(f => f.ProjectId == id).ToDictionaryAsync(f => f.Id, ct);
-
-            return Results.Ok(items.Select(i =>
-            {
-                var feat = i.FeatureId.HasValue && features.TryGetValue(i.FeatureId.Value, out var f) ? f : null;
-                return new
-                {
-                    i.Id,
-                    i.IssueNumber,
-                    i.Title,
-                    i.Body,
-                    i.Author,
-                    i.ReactionsCount,
-                    labels = JsonSerializer.Deserialize<List<string>>(i.LabelsJson, JsonOpts) ?? [],
-                    i.OwnerAttemptedDirectWorkLabel,
-                    i.State,
-                    i.SuggestedGroup,
-                    i.DuplicateOfIssueNumber,
-                    i.HtmlUrl,
-                    i.CreatedAt,
-                    linkedFeature = feat is null ? null : new { feat.Id, feat.Title, feat.Slug, feat.State }
-                };
-            }));
-        }).RequireAuthorization(FactoryRoles.ViewerPolicy);
+            return Results.Ok(new { regrouped = items.Count });
+        }).RequireAuthorization(FactoryRoles.OperatorPolicy);
 
         app.MapPost("/api/inbox/{target}", async (
             string target,
@@ -605,6 +678,11 @@ public static class ProjectAndFeatureEndpoints
             if (await db.FeatureSpecs.AnyAsync(f => f.ProjectId == id && f.Slug == slug, ct))
                 slug = $"{slug}-{Random.Shared.Next(10, 99)}";
 
+            var mergedSourceNumbers = req.IssueNumbers
+                .Concat(drafted.SourceIssueNumbers)
+                .Distinct()
+                .ToList();
+
             var feature = new FeatureSpecEntity
             {
                 ProjectId = id,
@@ -612,11 +690,16 @@ public static class ProjectAndFeatureEndpoints
                 Slug = slug,
                 Path = $"docs/features/{project.CurrentSpecVersion:D3}-{slug}.md",
                 SpecMarkdown = drafted.FeatureSpecMarkdown,
-                SourceIssueNumbersJson = JsonSerializer.Serialize(drafted.SourceIssueNumbers, JsonOpts),
+                SourceIssueNumbersJson = JsonSerializer.Serialize(mergedSourceNumbers, JsonOpts),
                 State = FeatureSpecState.Draft
             };
 
             db.FeatureSpecs.Add(feature);
+            foreach (var src in sourceItems)
+            {
+                src.FeatureId = feature.Id;
+                src.State = InboxItemState.Planned;
+            }
             await db.SaveChangesAsync(ct);
             return Results.Created($"/api/features/{feature.Id}/status", feature);
         }).RequireAuthorization(FactoryRoles.AdminPolicy);

@@ -1454,6 +1454,31 @@ public sealed class FactoryOrchestrationCoordinator(
                     var project = await db.Projects.FirstOrDefaultAsync(p => p.Id == repo.ProjectId, ct);
                     var templateId = project?.TemplateId ?? "dotnet-react";
 
+                    // 0. Clean up any legacy manually-labelled GitHub issues that were previously promoted into WorkItems (#19)
+                    var rogueManualItems = (await db.WorkItems
+                            .Where(w => w.RepoId == repo.Id && w.State != WorkItemStateKind.Merged)
+                            .ToListAsync(ct))
+                        .Where(w => string.Equals(w.IssueNodeId, $"I_{repo.Name}_{w.IssueNumber}", StringComparison.OrdinalIgnoreCase))
+                        .ToList();
+
+                    if (rogueManualItems.Count > 0)
+                    {
+                        var rogueIds = rogueManualItems.Select(w => w.Id).ToList();
+                        db.AgentSessions.RemoveRange(await db.AgentSessions.Where(s => rogueIds.Contains(s.WorkItemId)).ToListAsync(ct));
+                        db.Approvals.RemoveRange(await db.Approvals.Where(a => rogueIds.Contains(a.WorkItemId)).ToListAsync(ct));
+                        db.Findings.RemoveRange(await db.Findings.Where(f => rogueIds.Contains(f.WorkItemId)).ToListAsync(ct));
+                        db.ReviewRounds.RemoveRange(await db.ReviewRounds.Where(r => rogueIds.Contains(r.WorkItemId)).ToListAsync(ct));
+                        db.GateEvaluations.RemoveRange(await db.GateEvaluations.Where(g => rogueIds.Contains(g.WorkItemId)).ToListAsync(ct));
+                        db.WorkItems.RemoveRange(rogueManualItems);
+                        await db.SaveChangesAsync(ct);
+
+                        foreach (var rogue in rogueManualItems)
+                        {
+                            await gitHub.RemoveIssueLabelAsync(repo.Owner, repo.Name, rogue.IssueNumber, policy.WorkLabel, ct);
+                            progressed++;
+                        }
+                    }
+
                     // 1. Self-heal missing .github/workflows/*.yml and reconcile ruleset bypass/CodeQL state
                     var workflowsBackfilled = await gitHub.EnsureWorkflowsAndRulesetReadyAsync(
                         repo.InstallationId,
@@ -1839,43 +1864,40 @@ public sealed class FactoryOrchestrationCoordinator(
             ? lbls.EnumerateArray().Select(x => x.TryGetProperty("name", out var n) ? n.GetString() ?? string.Empty : string.Empty).Where(s => s.Length > 0).ToList()
             : [];
 
-        // §5.6: Removal of work label cancels in-flight or queued item
-        if (string.Equals(action, "unlabeled", StringComparison.OrdinalIgnoreCase))
+        var hasWorkLabel = labels.Any(x => string.Equals(x, policy.WorkLabel, StringComparison.OrdinalIgnoreCase));
+        var existingWi = await db.WorkItems.FirstOrDefaultAsync(w => w.RepoId == repo.Id && w.IssueNumber == issueNumber, ct);
+
+        // Ignore immediate webhook echoes from issues Demo-Factory itself just created via CreateIssueAsync (including Epics)
+        if (existingWi is null && gitHub.IsRecentlyFactoryCreatedIssue(repo.Owner, repo.Name, issueNumber))
+            return;
+
+        // Ignore webhook echoes for factory-created Epics (tracked on FeatureSpecs.EpicIssueNumber, not as individual coding tasks)
+        var isFactoryEpic = labels.Any(x => string.Equals(x, "epic", StringComparison.OrdinalIgnoreCase))
+            && await db.FeatureSpecs.AnyAsync(f => f.ProjectId == repo.ProjectId && f.EpicIssueNumber == issueNumber, ct);
+        if (isFactoryEpic)
+            return;
+
+        // Core invariant: ONLY issues created by Demo-Factory itself (already present in db.WorkItems) are vetted tasks.
+        // Any issue created manually on GitHub — even by the repository owner and even if someone manually adds the 'factory'
+        // label — MUST stay in the Issue Inbox and go through vetted Feature Specification synthesis!
+        if (existingWi is null)
         {
-            var hasWorkLabel = labels.Any(x => string.Equals(x, policy.WorkLabel, StringComparison.OrdinalIgnoreCase));
-            if (!hasWorkLabel)
+            if (hasWorkLabel)
             {
-                var existingWi = await db.WorkItems.FirstOrDefaultAsync(w => w.RepoId == repo.Id && w.IssueNumber == issueNumber, ct);
-                if (existingWi is not null && existingWi.State is not (WorkItemStateKind.Merged or WorkItemStateKind.Cancelled))
-                {
-                    existingWi.State = WorkItemStateKind.Cancelled;
-                    existingWi.BoardStatus = BoardStatus.Backlog;
-                    existingWi.PassesWorkLabelRule = false;
-                    existingWi.BlockedReason = "Work label removed.";
-                    existingWi.UpdatedAt = DateTimeOffset.UtcNow;
-                    await db.SaveChangesAsync(ct);
-                    await notifier.BroadcastWorkItemChangedAsync(existingWi.Id, repo.Id, existingWi.State.ToString(), ct);
-                }
-                return;
+                await gitHub.RemoveIssueLabelAsync(repo.Owner, repo.Name, issueNumber, policy.WorkLabel, ct);
             }
-        }
 
-        var labelAppliedBy = string.Equals(action, "labeled", StringComparison.OrdinalIgnoreCase)
-            ? senderLogin
-            : TrustBoundary.IsOwnerOrFactory(author, envOptions.Value.OwnerLogin, envOptions.Value.FactoryAppSlug) ? senderLogin : null;
+            var cleanedLabels = labels
+                .Where(x => !string.Equals(x, policy.WorkLabel, StringComparison.OrdinalIgnoreCase))
+                .ToList();
 
-        var check = TrustBoundary.EvaluateWorkLabelRule(new WorkLabelContext(
-            author, labels, labelAppliedBy, policy.WorkLabel, envOptions.Value.OwnerLogin, envOptions.Value.FactoryAppSlug));
-
-        if (!check.Passed)
-        {
-            // Keep in Issue Inbox (§5.6); NEVER assign or schedule!
             var inbox = await db.InboxItems.FirstOrDefaultAsync(i => i.RepoId == repo.Id && i.IssueNumber == issueNumber, ct);
-            var attemptedDirectLabel = check.FailureCode == "OutsideAuthorRequiresFeature"
-                && TrustBoundary.IsOwnerOrFactory(senderLogin, envOptions.Value.OwnerLogin, envOptions.Value.FactoryAppSlug);
-
             if (inbox is null)
             {
+                var fastGroup = ProjectManagerAgent.BuildDeterministicInboxGroups(
+                    [new UntrustedInboxIssue(issueNumber, author, title, body)])
+                    .Suggestions.FirstOrDefault()?.SuggestedGroup ?? "General Feedback";
+
                 db.InboxItems.Add(new InboxItemEntity
                 {
                     RepoId = repo.Id,
@@ -1884,50 +1906,49 @@ public sealed class FactoryOrchestrationCoordinator(
                     Title = title,
                     Body = body,
                     Author = author,
-                    LabelsJson = JsonSerializer.Serialize(labels, JsonOpts),
-                    OwnerAttemptedDirectWorkLabel = attemptedDirectLabel,
+                    LabelsJson = JsonSerializer.Serialize(cleanedLabels, JsonOpts),
+                    OwnerAttemptedDirectWorkLabel = hasWorkLabel,
+                    SuggestedGroup = fastGroup,
                     State = InboxItemState.New,
                     HtmlUrl = $"https://github.com/{repo.Owner}/{repo.Name}/issues/{issueNumber}"
                 });
             }
-            else if (attemptedDirectLabel)
+            else
             {
-                inbox.OwnerAttemptedDirectWorkLabel = true;
+                inbox.Title = title;
+                inbox.Body = body;
+                inbox.LabelsJson = JsonSerializer.Serialize(cleanedLabels, JsonOpts);
+                if (hasWorkLabel)
+                    inbox.OwnerAttemptedDirectWorkLabel = true;
             }
 
             await db.SaveChangesAsync(ct);
             return;
         }
 
-        var wi = await db.WorkItems.FirstOrDefaultAsync(w => w.RepoId == repo.Id && w.IssueNumber == issueNumber, ct);
-        if (wi is null)
+        // §5.6: Removal of work label on an existing factory-managed WorkItem cancels in-flight or queued work
+        if (string.Equals(action, "unlabeled", StringComparison.OrdinalIgnoreCase) && !hasWorkLabel)
         {
-            wi = new WorkItemEntity
+            if (existingWi.State is not (WorkItemStateKind.Merged or WorkItemStateKind.Cancelled))
             {
-                RepoId = repo.Id,
-                IssueNumber = issueNumber,
-                IssueNodeId = $"I_{repo.Name}_{issueNumber}",
-                ProjectItemId = $"PVTI_{issueNumber}",
-                Title = title,
-                BodyMarkdown = body,
-                LabelsJson = JsonSerializer.Serialize(labels, JsonOpts),
-                IssueAuthor = author,
-                WorkLabelAppliedBy = labelAppliedBy,
-                PassesWorkLabelRule = true,
-                State = WorkItemStateKind.Queued,
-                BoardStatus = BoardStatus.Backlog,
-                CodingModel = policy.Models.Coding
-            };
-            db.WorkItems.Add(wi);
-            await db.SaveChangesAsync(ct);
+                existingWi.State = WorkItemStateKind.Cancelled;
+                existingWi.BoardStatus = BoardStatus.Backlog;
+                existingWi.PassesWorkLabelRule = false;
+                existingWi.BlockedReason = "Work label removed.";
+                existingWi.UpdatedAt = DateTimeOffset.UtcNow;
+                await db.SaveChangesAsync(ct);
+                await notifier.BroadcastWorkItemChangedAsync(existingWi.Id, repo.Id, existingWi.State.ToString(), ct);
+            }
+            return;
         }
-        else if (string.Equals(action, "edited", StringComparison.OrdinalIgnoreCase) && wi.State == WorkItemStateKind.NeedsClarification)
+
+        if (string.Equals(action, "edited", StringComparison.OrdinalIgnoreCase) && existingWi.State == WorkItemStateKind.NeedsClarification)
         {
-            wi.Title = title;
-            wi.BodyMarkdown = body;
-            wi.State = WorkItemStateKind.Queued;
-            wi.BoardStatus = BoardStatus.Ready;
-            wi.UpdatedAt = DateTimeOffset.UtcNow;
+            existingWi.Title = title;
+            existingWi.BodyMarkdown = body;
+            existingWi.State = WorkItemStateKind.Queued;
+            existingWi.BoardStatus = BoardStatus.Ready;
+            existingWi.UpdatedAt = DateTimeOffset.UtcNow;
             await db.SaveChangesAsync(ct);
             await SelectAndStartScheduledItemsActivityAsync(repo.Id, ct);
         }

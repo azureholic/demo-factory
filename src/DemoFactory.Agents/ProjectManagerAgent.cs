@@ -399,7 +399,20 @@ public sealed partial class ProjectManagerAgent(
             {
               "type": "object",
               "required": ["suggestions"],
-              "properties": { "suggestions": { "type": "array" } }
+              "properties": {
+                "suggestions": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "required": ["issueNumber", "suggestedGroup"],
+                    "properties": {
+                      "issueNumber": { "type": "integer" },
+                      "suggestedGroup": { "type": "string", "minLength": 2 },
+                      "likelyDuplicateOf": { "type": ["integer", "null"] }
+                    }
+                  }
+                }
+              }
             }
             """;
 
@@ -1092,7 +1105,7 @@ public sealed partial class ProjectManagerAgent(
             affectedInProgress);
     }
 
-    private static InboxGroupingOutput BuildDeterministicInboxGroups(IReadOnlyList<UntrustedInboxIssue> issues)
+    public static InboxGroupingOutput BuildDeterministicInboxGroups(IReadOnlyList<UntrustedInboxIssue> issues)
     {
         var list = new List<InboxSuggestionItem>();
         var seenByGroup = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
@@ -1100,11 +1113,15 @@ public sealed partial class ProjectManagerAgent(
         foreach (var issue in issues)
         {
             var text = $"{issue.Title} {issue.Body}".ToLowerInvariant();
-            var group = text.Contains("contrast") || text.Contains("dark") || text.Contains("keyboard") || text.Contains("a11y")
-                ? "Accessibility & Theme Polish"
-                : text.Contains("csv") || text.Contains("export") || text.Contains("download")
-                    ? "Export & Reporting"
-                    : "General Enhancements";
+            var group = text.Contains("npm") || text.Contains("build") || text.Contains("compile") || text.Contains("install") || text.Contains("package")
+                ? "Build & Tooling"
+                : text.Contains("contrast") || text.Contains("dark") || text.Contains("keyboard") || text.Contains("a11y")
+                    ? "Accessibility & Theme Polish"
+                    : text.Contains("csv") || text.Contains("export") || text.Contains("download") || text.Contains("pdf")
+                        ? "Export & Reporting"
+                        : text.Contains("audio") || text.Contains("sound") || text.Contains("tempo") || text.Contains("bpm")
+                            ? "Audio & Playback"
+                            : "General Feedback";
 
             int? dup = seenByGroup.TryGetValue(group, out var first) && issue.Title.Split(' ').Length <= 6 ? first : null;
             seenByGroup.TryAdd(group, issue.IssueNumber);

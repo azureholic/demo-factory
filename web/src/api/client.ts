@@ -260,6 +260,8 @@ export const api = {
   getFeatureStatus: (featureId: string) => request<any>(`/api/features/${featureId}/status`),
 
   getInbox: (projectId: string) => request<any[]>(`/api/projects/${projectId}/inbox`),
+  regroupInbox: (projectId: string) =>
+    request<any>(`/api/projects/${projectId}/inbox:regroup`, { method: 'POST' }),
   dismissInboxItem: (inboxId: string) => request<any>(`/api/inbox/${inboxId}:dismiss`, { method: 'POST' }),
 
   getSpec: (projectId: string) => request<any>(`/api/projects/${projectId}/spec`),
