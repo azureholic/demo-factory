@@ -296,6 +296,11 @@ public sealed class FactoryOrchestrationCoordinator(
             });
         }
 
+        if (!signals.HasCiWorkflow)
+        {
+            policy.Gate.RequiredChecks = [];
+        }
+
         var checkRuns = signals.ActualCheckRuns
             ?? policy.Gate.RequiredChecks.Select(name => new CheckRunSnapshot(
                 name,
@@ -551,24 +556,14 @@ public sealed class FactoryOrchestrationCoordinator(
         await auditLogger.RecordAsync("factory-orchestrator", "WorkItemMerged", "WorkItem", wi.Id.ToString(), after: new { prNumber, mergeSha }, issueNumber: wi.IssueNumber, prNumber: prNumber, sha: mergeSha, ct: ct);
         await notifier.BroadcastWorkItemChangedAsync(wi.Id, wi.RepoId, wi.State.ToString(), ct);
 
-        // §5.6 Step 5: If all items of a feature are Done, close linked source inbox issues when policy allows
+        // §5.6 Step 5: If all items of a feature are Done (and its spec PR is merged), close Epic & linked source inbox issues
         if (wi.FeatureId.HasValue)
         {
             var (policy, _, _, _) = await policyRepo.GetPolicyAsync(repo.Owner, repo.Name, ct);
-            if (policy.Intake.CloseSourceIssuesWhenDone)
-            {
-                var remainingOpen = await db.WorkItems.AnyAsync(w => w.FeatureId == wi.FeatureId && w.State != WorkItemStateKind.Merged && w.State != WorkItemStateKind.Cancelled, ct);
-                if (!remainingOpen)
-                {
-                    var inboxSources = await db.InboxItems.Where(i => i.FeatureId == wi.FeatureId && i.State != InboxItemState.Done).ToListAsync(ct);
-                    foreach (var src in inboxSources)
-                    {
-                        src.State = InboxItemState.Done;
-                        await gitHub.PostCommentAsync(repo.Owner, repo.Name, src.IssueNumber, $"Completed via feature `{wi.FeatureSlug}`.", ct);
-                    }
-                    await db.SaveChangesAsync(ct);
-                }
-            }
+            var openPrs = envOptions.Value.GetEffectiveSandboxMode()
+                ? []
+                : await gitHub.InspectOpenPullRequestsAsync(repo.Owner, repo.Name, ct);
+            await CloseCompletedFeaturesAsync(db, repo, policy, openPrs, ct);
         }
 
         // §10.3: If another PR in this repo was waiting for merge serialization, update its branch & arm auto-merge
@@ -1135,6 +1130,16 @@ public sealed class FactoryOrchestrationCoordinator(
             await db.SaveChangesAsync(ct);
 
             await auditLogger.RecordAsync(actor, "FeatureIncrementApplied", "FeatureSpec", feature.Id.ToString(), after: new { feature.Slug, epic = epicRef.Number, specVersion = nextSpecVersion }, ct: ct);
+
+            if (!envOptions.Value.GetEffectiveSandboxMode())
+            {
+                _ = Task.Run(async () =>
+                {
+                    try { await ReconcileActiveWorkItemsOnceAsync(repo.Id, CancellationToken.None); }
+                    catch (Exception ex) { logger.LogDebug(ex, "Post-feature spec PR reconciliation deferred to next tick."); }
+                }, CancellationToken.None);
+            }
+
             return steps;
         }
         finally
@@ -1480,13 +1485,15 @@ public sealed class FactoryOrchestrationCoordinator(
                     }
 
                     // 1. Self-heal missing .github/workflows/*.yml and reconcile ruleset bypass/CodeQL state
-                    var workflowsBackfilled = await gitHub.EnsureWorkflowsAndRulesetReadyAsync(
+                    var (workflowsBackfilled, hasCiWorkflow) = await gitHub.EnsureWorkflowsAndRulesetReadyAsync(
                         repo.InstallationId,
                         repo.Owner,
                         repo.Name,
                         templateId,
                         policy.Gate.RequiredChecks,
                         ct);
+
+                    var effectiveRequiredChecks = hasCiWorkflow ? policy.Gate.RequiredChecks : [];
 
                     var activeItems = await db.WorkItems
                         .Where(w => w.RepoId == repo.Id && activeStates.Contains(w.State))
@@ -1528,23 +1535,38 @@ public sealed class FactoryOrchestrationCoordinator(
                         }
                     }
 
-                    if (activeItems.Count == 0 && !workflowsBackfilled)
-                    {
-                        LastReconcileAt = DateTimeOffset.UtcNow;
-                        LastReconcileSummary = $"{repo.FullName}: idle (0 active work items, workflowsSeeded={workflowsBackfilled})";
-                        continue;
-                    }
-
-                    var openPrs = await gitHub.InspectOpenPullRequestsAsync(repo.Owner, repo.Name, ct);
+                    var openPrs = (await gitHub.InspectOpenPullRequestsAsync(repo.Owner, repo.Name, ct)).ToList();
 
                     // If workflows were just seeded onto main, update open PR branches so they inherit ci.yml immediately
-                    if (workflowsBackfilled)
+                    if (workflowsBackfilled && openPrs.Count > 0)
                     {
                         foreach (var opr in openPrs)
                         {
                             await gitHub.UpdatePullRequestBranchAsync(repo.Owner, repo.Name, opr.Number, ct);
                         }
-                        openPrs = await gitHub.InspectOpenPullRequestsAsync(repo.Owner, repo.Name, ct);
+                        openPrs = (await gitHub.InspectOpenPullRequestsAsync(repo.Owner, repo.Name, ct)).ToList();
+                    }
+
+                    // 2. Reconcile documentation/specification PRs (spec/*) and close completed Feature Epics + source issues
+                    var effectiveAutonomyForRepo = repoSettingsForWip?.Autonomy ?? global?.Autonomy ?? policy.Autonomy;
+                    progressed += await ReconcileSpecPullRequestsAsync(
+                        db,
+                        repo,
+                        project,
+                        policy,
+                        effectiveAutonomyForRepo,
+                        lineState?.State ?? LineStatus.Running,
+                        hasCiWorkflow,
+                        openPrs,
+                        ct);
+
+                    progressed += await CloseCompletedFeaturesAsync(db, repo, policy, openPrs, ct);
+
+                    if (activeItems.Count == 0 && !workflowsBackfilled)
+                    {
+                        LastReconcileAt = DateTimeOffset.UtcNow;
+                        LastReconcileSummary = $"{repo.FullName}: idle (0 active work items, openPrs={openPrs.Count}, progressed={progressed}, hasCi={hasCiWorkflow})";
+                        continue;
                     }
 
                     foreach (var wi in activeItems)
@@ -1652,7 +1674,7 @@ public sealed class FactoryOrchestrationCoordinator(
                                 continue;
                             }
 
-                            var allChecksCompleted = policy.Gate.RequiredChecks.All(reqName =>
+                            var allChecksCompleted = effectiveRequiredChecks.All(reqName =>
                                 liveSignals.CheckRuns.Any(cr =>
                                     string.Equals(cr.Name, reqName, StringComparison.OrdinalIgnoreCase)
                                     && string.Equals(cr.Sha, liveSignals.HeadSha, StringComparison.OrdinalIgnoreCase)
@@ -1665,7 +1687,7 @@ public sealed class FactoryOrchestrationCoordinator(
                                 continue;
                             }
 
-                            var allChecksGreen = allChecksCompleted && policy.Gate.RequiredChecks.All(reqName =>
+                            var allChecksGreen = allChecksCompleted && effectiveRequiredChecks.All(reqName =>
                                 liveSignals.CheckRuns.Any(cr =>
                                     string.Equals(cr.Name, reqName, StringComparison.OrdinalIgnoreCase)
                                     && string.Equals(cr.Sha, liveSignals.HeadSha, StringComparison.OrdinalIgnoreCase)
@@ -1706,7 +1728,8 @@ public sealed class FactoryOrchestrationCoordinator(
                                     liveSignals.CiFailureExcerpts,
                                     SpecConformancePassed: true,
                                     ActualCheckRuns: liveSignals.CheckRuns,
-                                    PreviewWorkflowSucceeded: allChecksGreen),
+                                    PreviewWorkflowSucceeded: allChecksGreen,
+                                    HasCiWorkflow: hasCiWorkflow),
                                 carryOverReview,
                                 ct);
 
@@ -1759,7 +1782,7 @@ public sealed class FactoryOrchestrationCoordinator(
                         }
                     }
                     LastReconcileAt = DateTimeOffset.UtcNow;
-                    LastReconcileSummary = $"{repo.FullName}: progressed={progressed}, workflowsSeeded={workflowsBackfilled}, active={activeItems.Count}";
+                    LastReconcileSummary = $"{repo.FullName}: progressed={progressed}, hasCi={hasCiWorkflow}, active={activeItems.Count}";
                 }
                 catch (Exception repoEx) when (repoEx is not OperationCanceledException)
                 {
@@ -2013,6 +2036,14 @@ public sealed class FactoryOrchestrationCoordinator(
                         await ResumeLineAsync(repo.Id, "auto-revert-merged", ct);
                     }
                 }
+                else
+                {
+                    var headBranch = headEl.TryGetProperty("ref", out var rf) ? rf.GetString() ?? string.Empty : string.Empty;
+                    if (headBranch.StartsWith("spec/", StringComparison.OrdinalIgnoreCase))
+                    {
+                        await ReconcileActiveWorkItemsOnceAsync(repo.Id, ct);
+                    }
+                }
             }
         }
     }
@@ -2053,6 +2084,273 @@ public sealed class FactoryOrchestrationCoordinator(
                 await ResumeLineAsync(repo.Id, "main-workflow-green", ct);
             }
         }
+    }
+
+    private async Task<int> ReconcileSpecPullRequestsAsync(
+        DemoFactoryDbContext db,
+        RepositoryEntity repo,
+        ProjectEntity? project,
+        RepoPolicy policy,
+        AutonomyLevel effectiveAutonomy,
+        LineStatus lineStatus,
+        bool hasCiWorkflow,
+        List<LivePullRequestSnapshot> openPrs,
+        CancellationToken ct)
+    {
+        var specPrs = openPrs
+            .Where(p => !p.IsFork
+                        && TrustBoundary.IsOwnerOrFactory(p.AuthorLogin, envOptions.Value.OwnerLogin, envOptions.Value.FactoryAppSlug)
+                        && p.HeadRef.StartsWith("spec/", StringComparison.OrdinalIgnoreCase))
+            .OrderBy(p => p.Number)
+            .ToList();
+
+        if (specPrs.Count == 0)
+        {
+            // Self-heal: if an approved/completed feature's docs/features/*.md file is not on main yet and has no open PR, open its spec PR
+            var features = await db.FeatureSpecs
+                .Where(f => f.ProjectId == repo.ProjectId
+                            && (f.State == FeatureSpecState.Applied || f.State == FeatureSpecState.Completed)
+                            && f.Path != "")
+                .OrderBy(f => f.SpecVersion)
+                .ToListAsync(ct);
+
+            foreach (var feat in features)
+            {
+                if (!await gitHub.HasFileOnDefaultBranchAsync(repo.Owner, repo.Name, feat.Path, ct))
+                {
+                    await gitHub.OpenDocsPullRequestAsync(
+                        repo.Owner,
+                        repo.Name,
+                        $"spec/feature-{feat.Slug}",
+                        $"docs(spec): add feature {feat.Title}",
+                        new Dictionary<string, string>
+                        {
+                            [feat.Path] = feat.SpecMarkdown,
+                            ["docs/spec.md"] = project?.SpecMarkdown ?? string.Empty
+                        },
+                        ct);
+                    return 1;
+                }
+            }
+
+            return 0;
+        }
+
+        // Process one spec/* PR per tick so sequential feature specs rebase cleanly onto main without racing on docs/spec.md
+        var specPr = specPrs[0];
+        var progressed = 0;
+
+        if (specPr.IsDraft)
+        {
+            await gitHub.SetPullRequestDraftAsync(repo.Owner, repo.Name, specPr.Number, isDraft: false, ct);
+            progressed++;
+        }
+
+        var liveSignals = await gitHub.GetPullRequestGateSignalsAsync(repo.Owner, repo.Name, specPr.Number, specPr.HeadSha, ct);
+        if (liveSignals.Merged)
+        {
+            openPrs.RemoveAll(p => p.Number == specPr.Number);
+            return progressed + 1;
+        }
+
+        if (liveSignals.ChangedFiles.Count == 0 || liveSignals.ChangedFiles.Any(f => !PathGlobMatcher.IsDocsOnlyPath(f.Path)))
+            return progressed;
+
+        if (string.Equals(liveSignals.MergeableState, "behind", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(liveSignals.MergeableState, "dirty", StringComparison.OrdinalIgnoreCase))
+        {
+            var updatedCleanly = !string.Equals(liveSignals.MergeableState, "dirty", StringComparison.OrdinalIgnoreCase)
+                && await gitHub.UpdatePullRequestBranchAsync(repo.Owner, repo.Name, specPr.Number, ct);
+
+            if (!updatedCleanly)
+            {
+                await gitHub.RebaseDocsPullRequestBranchAsync(repo.Owner, repo.Name, specPr.Number, project?.SpecMarkdown, ct);
+            }
+
+            liveSignals = await gitHub.GetPullRequestGateSignalsAsync(repo.Owner, repo.Name, specPr.Number, specPr.HeadSha, ct);
+            progressed++;
+        }
+
+        // Verify that this spec/* PR corresponds to an operator-approved FeatureSpec or SpecVersion in Demo-Factory
+        var recordedApprovals = new List<RecordedApproval>();
+        if (specPr.HeadRef.StartsWith("spec/feature-", StringComparison.OrdinalIgnoreCase))
+        {
+            var slug = specPr.HeadRef["spec/feature-".Length..];
+            var approvedFeature = await db.FeatureSpecs.FirstOrDefaultAsync(
+                f => f.ProjectId == repo.ProjectId
+                     && f.Slug == slug
+                     && (f.State == FeatureSpecState.Approved || f.State == FeatureSpecState.Applying || f.State == FeatureSpecState.Applied || f.State == FeatureSpecState.Completed),
+                ct);
+
+            if (approvedFeature is not null)
+            {
+                recordedApprovals.Add(new RecordedApproval(
+                    ApprovalKind.SpecChange,
+                    liveSignals.HeadSha,
+                    ApprovalDecision.Approved,
+                    envOptions.Value.OwnerLogin));
+            }
+        }
+        else if (specPr.HeadRef.StartsWith("spec/v", StringComparison.OrdinalIgnoreCase)
+                 && int.TryParse(specPr.HeadRef["spec/v".Length..], out var specVer))
+        {
+            var hasSpecVer = await db.SpecVersions.AnyAsync(
+                sv => sv.ProjectId == repo.ProjectId && sv.Version == specVer,
+                ct);
+            if (hasSpecVer)
+            {
+                recordedApprovals.Add(new RecordedApproval(
+                    ApprovalKind.SpecChange,
+                    liveSignals.HeadSha,
+                    ApprovalDecision.Approved,
+                    envOptions.Value.OwnerLogin));
+            }
+        }
+
+        var specPolicy = RepoPolicy.ParseYaml(policy.ToYaml());
+        if (!hasCiWorkflow)
+        {
+            specPolicy.Gate.RequiredChecks = [];
+        }
+
+        var publicSafe = pmAgent.CheckPublicSafeDeterministic(project?.SpecMarkdown ?? string.Empty);
+        var specGateInput = new GateInput(
+            Profile: GateProfile.Spec,
+            EvaluatedSha: liveSignals.HeadSha,
+            CurrentPrHeadSha: liveSignals.HeadSha,
+            Policy: specPolicy,
+            EffectiveAutonomy: effectiveAutonomy,
+            CheckRuns: liveSignals.CheckRuns,
+            HasCopilotReviewOnHeadSha: liveSignals.HasCopilotReviewOnHeadSha,
+            CarryOverCopilotReviewFromUnchangedDiff: true,
+            Findings: [],
+            ChangedFiles: liveSignals.ChangedFiles,
+            MergedAcceptanceTestIssueKeys: [],
+            Labels: [],
+            SpecConformanceCheck: ModelCheckVerdict.NotApplicable(),
+            AtMappingCheck: ModelCheckVerdict.NotApplicable(),
+            PublicSafeCheck: publicSafe.Passed ? ModelCheckVerdict.Pass() : ModelCheckVerdict.Fail(1, "Public-safe check flagged specification content"),
+            CodeScanningCompletedOnHeadSha: true,
+            NewCodeScanningAlertsAboveThreshold: 0,
+            DependencyReviewPassed: true,
+            Dependabot: null,
+            AtJUnit: null,
+            FeatureAcceptance: null,
+            PreviewRun: null,
+            LineStatus: lineStatus,
+            Approvals: recordedApprovals,
+            Origin: new TrustedOriginContext(
+                $"{repo.Owner}/{repo.Name}",
+                $"{repo.Owner}/{repo.Name}",
+                IsFork: false,
+                PrAuthor: specPr.AuthorLogin,
+                OwnerLogin: envOptions.Value.OwnerLogin,
+                FactoryAppSlug: envOptions.Value.FactoryAppSlug));
+
+        var gateResult = ReviewGateEvaluator.Evaluate(specGateInput);
+        var sigKey = $"specpr:{repo.Id}:{specPr.Number}";
+        var sigVal = $"{liveSignals.HeadSha}:{gateResult.Outcome.GetType().Name}";
+
+        if (!_lastGateSignatureByWorkItem.TryGetValue(sigKey, out var prevVal) || !string.Equals(prevVal, sigVal, StringComparison.Ordinal))
+        {
+            await gitHub.PostReviewGateCheckRunAsync(repo.InstallationId, repo.Owner, repo.Name, liveSignals.HeadSha, gateResult, ct);
+            _lastGateSignatureByWorkItem[sigKey] = sigVal;
+            progressed++;
+        }
+
+        if (gateResult.Passed && effectiveAutonomy != AutonomyLevel.L0)
+        {
+            var mergedNow = await gitHub.TrySquashMergePullRequestAsync(repo.Owner, repo.Name, specPr.Number, liveSignals.HeadSha, ct);
+            if (mergedNow)
+            {
+                openPrs.RemoveAll(p => p.Number == specPr.Number);
+                progressed++;
+            }
+        }
+
+        return progressed;
+    }
+
+    private async Task<int> CloseCompletedFeaturesAsync(
+        DemoFactoryDbContext db,
+        RepositoryEntity repo,
+        RepoPolicy policy,
+        IReadOnlyCollection<LivePullRequestSnapshot> openPrs,
+        CancellationToken ct)
+    {
+        var appliedFeatures = await db.FeatureSpecs
+            .Where(f => f.ProjectId == repo.ProjectId && f.State == FeatureSpecState.Applied)
+            .ToListAsync(ct);
+
+        if (appliedFeatures.Count == 0)
+            return 0;
+
+        var completedCount = 0;
+        foreach (var feat in appliedFeatures)
+        {
+            var featItems = await db.WorkItems
+                .Where(w => w.FeatureId == feat.Id && w.State != WorkItemStateKind.Cancelled)
+                .ToListAsync(ct);
+
+            if (featItems.Count == 0 || featItems.Any(w => w.State != WorkItemStateKind.Merged))
+                continue;
+
+            // Wait until the feature's spec/feature-<slug> PR has also merged before marking the feature Completed
+            var specBranch = $"spec/feature-{feat.Slug}";
+            if (openPrs.Any(p => string.Equals(p.HeadRef, specBranch, StringComparison.OrdinalIgnoreCase)))
+                continue;
+
+            if (feat.EpicIssueNumber is > 0)
+            {
+                await gitHub.CloseIssueAsync(
+                    repo.Owner,
+                    repo.Name,
+                    feat.EpicIssueNumber.Value,
+                    $"All backlog items and specification updates for **{feat.Title}** (`{feat.Slug}`) have merged into `{repo.DefaultBranch}`.",
+                    ct);
+            }
+
+            if (policy.Intake.CloseSourceIssuesWhenDone)
+            {
+                var inboxSources = await db.InboxItems
+                    .Where(i => i.ProjectId == repo.ProjectId && i.FeatureId == feat.Id)
+                    .ToListAsync(ct);
+
+                var sourceNums = SafeDeserializeList<int>(feat.SourceIssueNumbersJson)
+                    .Concat(inboxSources.Select(i => i.IssueNumber))
+                    .Where(n => n > 0)
+                    .Distinct()
+                    .ToList();
+
+                foreach (var srcNum in sourceNums)
+                {
+                    var inboxEntity = inboxSources.FirstOrDefault(i => i.IssueNumber == srcNum)
+                        ?? await db.InboxItems.FirstOrDefaultAsync(i => i.ProjectId == repo.ProjectId && i.IssueNumber == srcNum, ct);
+
+                    var alreadyCommented = inboxEntity?.State == InboxItemState.Done;
+                    if (inboxEntity is not null)
+                    {
+                        inboxEntity.State = InboxItemState.Done;
+                        inboxEntity.FeatureId ??= feat.Id;
+                    }
+
+                    await gitHub.CloseIssueAsync(
+                        repo.Owner,
+                        repo.Name,
+                        srcNum,
+                        alreadyCommented ? null : $"Completed via feature **{feat.Title}** (`{feat.Slug}`).",
+                        ct);
+                }
+            }
+
+            feat.State = FeatureSpecState.Completed;
+            feat.UpdatedAt = DateTimeOffset.UtcNow;
+            await db.SaveChangesAsync(ct);
+            await auditLogger.RecordAsync("factory-orchestrator", "FeatureCompleted", "FeatureSpec", feat.Id.ToString(), after: new { feat.Slug, feat.EpicIssueNumber }, ct: ct);
+            completedCount++;
+        }
+
+        return completedCount;
     }
 
     private async Task MarkInboxProcessedAsync(string deliveryId, CancellationToken ct)

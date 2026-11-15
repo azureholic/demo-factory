@@ -79,15 +79,18 @@ public interface IGitHubGateway
     Task<string> CreateRepositoryFromTemplateAsync(string templateOwner, string templateRepo, string newOwner, string newRepo, bool isPublic, string specMarkdown, string adrMarkdown, CancellationToken ct = default);
     Task ApplySecurityBaselineAsync(string owner, string repo, bool isPublic, CancellationToken ct = default);
     Task ApplyRulesetsAndSettingsAsync(string owner, string repo, IReadOnlyList<string> requiredChecks, CancellationToken ct = default);
-    Task<bool> EnsureWorkflowsAndRulesetReadyAsync(long installationId, string owner, string repo, string templateId, IReadOnlyList<string> requiredChecks, CancellationToken ct = default);
+    Task<(bool WorkflowsSeeded, bool HasCiWorkflow)> EnsureWorkflowsAndRulesetReadyAsync(long installationId, string owner, string repo, string templateId, IReadOnlyList<string> requiredChecks, CancellationToken ct = default);
     Task<IReadOnlyList<LivePullRequestSnapshot>> InspectOpenPullRequestsAsync(string owner, string repo, CancellationToken ct = default);
     Task<LivePullRequestSnapshot?> InspectSinglePullRequestAsync(string owner, string repo, int prNumber, CancellationToken ct = default);
     Task<LivePullRequestGateSignals> GetPullRequestGateSignalsAsync(string owner, string repo, int prNumber, string headSha, CancellationToken ct = default);
     Task<bool> TrySquashMergePullRequestAsync(string owner, string repo, int prNumber, string expectedHeadSha, CancellationToken ct = default);
+    Task<string?> RebaseDocsPullRequestBranchAsync(string owner, string repo, int prNumber, string? canonicalSpecMarkdown, CancellationToken ct = default);
+    Task<bool> HasFileOnDefaultBranchAsync(string owner, string repo, string path, CancellationToken ct = default);
     Task<(string ProjectId, int ProjectNumber)> CopyProjectBoardAsync(string owner, string repo, string title, CancellationToken ct = default);
     Task<CreatedIssueRef> CreateIssueAsync(string owner, string repo, string title, string body, IReadOnlyList<string> labels, CancellationToken ct = default);
     bool IsRecentlyFactoryCreatedIssue(string owner, string repo, int issueNumber);
     Task UpdateIssueAsync(string owner, string repo, int issueNumber, string title, string body, CancellationToken ct = default);
+    Task CloseIssueAsync(string owner, string repo, int issueNumber, string? completionComment = null, CancellationToken ct = default);
     Task RemoveIssueLabelAsync(string owner, string repo, int issueNumber, string labelName, CancellationToken ct = default);
     Task UnlockConversationAsync(string owner, string repo, int issueOrPrNumber, CancellationToken ct = default);
     Task AddBlockedByDependencyAsync(string dependentIssueNodeId, string blockerIssueNodeId, CancellationToken ct = default);
@@ -514,7 +517,7 @@ public sealed class GitHubGateway(
             ct: ct);
     }
 
-    public async Task<bool> EnsureWorkflowsAndRulesetReadyAsync(
+    public async Task<(bool WorkflowsSeeded, bool HasCiWorkflow)> EnsureWorkflowsAndRulesetReadyAsync(
         long installationId,
         string owner,
         string repo,
@@ -524,7 +527,7 @@ public sealed class GitHubGateway(
     {
         await EnsureRepoAllowlistedAsync(owner, repo, ct);
         if (IsSandbox)
-            return false;
+            return (false, true);
 
         var resolvedInstallationId = await ResolveLiveInstallationIdAsync(installationId, owner, repo, ct);
         using var delegatedHttp = await CreateDelegatedHttpAsync(ct);
@@ -555,10 +558,11 @@ public sealed class GitHubGateway(
             || await IsCodeQlDefaultSetupConfiguredAsync(delegatedHttp, owner, repo, ct));
 
         using var existingCi = await TryGetJsonAsync(writeHttp, $"/repos/{owner}/{repo}/contents/.github/workflows/ci.yml", ct);
-        var missingCiWorkflow = existingCi is null;
+        var hasCiWorkflow = existingCi is not null;
 
         long? rulesetId = null;
         var hasCodeScanningRule = false;
+        var currentRequiredCheckCount = 0;
         using (var rulesetsDoc = await TryGetJsonAsync(delegatedHttp, $"/repos/{owner}/{repo}/rulesets", ct))
         {
             if (rulesetsDoc is not null && rulesetsDoc.RootElement.ValueKind == JsonValueKind.Array)
@@ -574,21 +578,30 @@ public sealed class GitHubGateway(
                     if (detailDoc is not null)
                     {
                         var root = detailDoc.RootElement;
-                        hasCodeScanningRule = root.TryGetProperty("rules", out var rArr)
-                            && rArr.ValueKind == JsonValueKind.Array
-                            && rArr.EnumerateArray().Any(r => r.TryGetProperty("type", out var tp) && tp.GetString() == "code_scanning");
+                        if (root.TryGetProperty("rules", out var rArr) && rArr.ValueKind == JsonValueKind.Array)
+                        {
+                            hasCodeScanningRule = rArr.EnumerateArray().Any(r => r.TryGetProperty("type", out var tp) && tp.GetString() == "code_scanning");
+                            var reqCheckRule = rArr.EnumerateArray().FirstOrDefault(r => r.TryGetProperty("type", out var tp) && tp.GetString() == "required_status_checks");
+                            if (reqCheckRule.ValueKind == JsonValueKind.Object
+                                && reqCheckRule.TryGetProperty("parameters", out var prm)
+                                && prm.TryGetProperty("required_status_checks", out var rsc)
+                                && rsc.ValueKind == JsonValueKind.Array)
+                            {
+                                currentRequiredCheckCount = rsc.GetArrayLength();
+                            }
+                        }
                     }
                     break;
                 }
             }
         }
 
-        async Task PutRulesetAsync(string enforcement)
+        async Task PutRulesetAsync(string enforcement, bool includeActionsCiChecks)
         {
             if (!rulesetId.HasValue)
                 return;
 
-            var checksList = requiredChecks
+            var checksList = (includeActionsCiChecks ? requiredChecks : Array.Empty<string>())
                 .Select(c => (object)new { context = c, integration_id = appOptions.Value.ActionsIntegrationId })
                 .Append(new { context = ReviewGateEvaluator.GateCheckName, integration_id = appOptions.Value.DemoFactoryIntegrationId })
                 .ToArray();
@@ -672,20 +685,27 @@ public sealed class GitHubGateway(
             }
         }
 
-        if (!missingCiWorkflow)
+        if (hasCiWorkflow)
         {
-            if (rulesetId.HasValue && hasCodeScanningRule && !codeQlConfigured)
+            var expectedCount = requiredChecks.Count + 1;
+            if (rulesetId.HasValue && ((hasCodeScanningRule && !codeQlConfigured) || currentRequiredCheckCount != expectedCount))
             {
-                await PutRulesetAsync("active");
+                await PutRulesetAsync("active", includeActionsCiChecks: true);
             }
-            return false;
+            return (false, true);
         }
 
         var templateKey = templateId.Contains("python", StringComparison.OrdinalIgnoreCase) ? "python-fastapi" : "dotnet-react";
         var templateDir = ResolveTemplateDirectory(templateKey);
         var workflowsDir = Path.Combine(templateDir, ".github", "workflows");
         if (!Directory.Exists(workflowsDir))
-            return false;
+        {
+            if (rulesetId.HasValue && currentRequiredCheckCount > 1)
+            {
+                await PutRulesetAsync("active", includeActionsCiChecks: false);
+            }
+            return (false, false);
+        }
 
         var seededAny = false;
         try
@@ -693,7 +713,7 @@ public sealed class GitHubGateway(
             // Temporarily pause branch ruleset enforcement so bootstrap workflows can be seeded onto default branch
             if (rulesetId.HasValue)
             {
-                await PutRulesetAsync("disabled");
+                await PutRulesetAsync("disabled", includeActionsCiChecks: false);
             }
 
             foreach (var wfFile in Directory.EnumerateFiles(workflowsDir, "*.yml", SearchOption.TopDirectoryOnly))
@@ -736,9 +756,11 @@ public sealed class GitHubGateway(
         }
         finally
         {
+            using var verifyCi = await TryGetJsonAsync(writeHttp, $"/repos/{owner}/{repo}/contents/.github/workflows/ci.yml", ct);
+            hasCiWorkflow = verifyCi is not null;
             if (rulesetId.HasValue)
             {
-                await PutRulesetAsync("active");
+                await PutRulesetAsync("active", includeActionsCiChecks: hasCiWorkflow);
             }
         }
 
@@ -753,7 +775,7 @@ public sealed class GitHubGateway(
                 ct: ct);
         }
 
-        return seededAny;
+        return (seededAny, hasCiWorkflow);
     }
 
     public async Task<IReadOnlyList<LivePullRequestSnapshot>> InspectOpenPullRequestsAsync(
@@ -1173,6 +1195,45 @@ public sealed class GitHubGateway(
             ct: ct);
     }
 
+    public async Task CloseIssueAsync(
+        string owner,
+        string repo,
+        int issueNumber,
+        string? completionComment = null,
+        CancellationToken ct = default)
+    {
+        await EnsureRepoAllowlistedAsync(owner, repo, ct);
+        await PaceWriteAsync(ct);
+
+        if (!IsSandbox)
+        {
+            await UnlockConversationAsync(owner, repo, issueNumber, ct);
+            using var http = await CreateDelegatedHttpAsync(ct);
+
+            if (!string.IsNullOrWhiteSpace(completionComment))
+            {
+                await TrySendGitHubRestAsync(http, HttpMethod.Post, $"/repos/{owner}/{repo}/issues/{issueNumber}/comments", new
+                {
+                    body = completionComment
+                }, ct);
+            }
+
+            await TrySendGitHubRestAsync(http, HttpMethod.Patch, $"/repos/{owner}/{repo}/issues/{issueNumber}", new
+            {
+                state = "closed",
+                state_reason = "completed"
+            }, ct);
+        }
+
+        await auditLogger.RecordAsync(
+            appOptions.Value.AppSlug,
+            "IssueClosedCompleted",
+            "Issue",
+            $"{owner}/{repo}#{issueNumber}",
+            issueNumber: issueNumber,
+            ct: ct);
+    }
+
     public async Task RemoveIssueLabelAsync(
         string owner,
         string repo,
@@ -1472,17 +1533,40 @@ public sealed class GitHubGateway(
         using var refDoc = await SendGitHubRestForJsonAsync(http, HttpMethod.Get, $"/repos/{owner}/{repo}/git/ref/heads/{defaultBranch}", null, ct);
         var baseSha = refDoc.RootElement.GetProperty("object").GetProperty("sha").GetString()!;
 
-        await TrySendGitHubRestAsync(http, HttpMethod.Post, $"/repos/{owner}/{repo}/git/refs", new
+        var branchCreated = await TrySendGitHubRestAsync(http, HttpMethod.Post, $"/repos/{owner}/{repo}/git/refs", new
         {
             @ref = $"refs/heads/{branchName}",
             sha = baseSha
         }, ct);
 
+        if (!branchCreated)
+        {
+            await TrySendGitHubRestAsync(http, HttpMethod.Patch, $"/repos/{owner}/{repo}/git/refs/heads/{branchName}", new
+            {
+                sha = baseSha,
+                force = true
+            }, ct);
+        }
+
+        string mainSpecMd = string.Empty;
+        if (filesToCommit.ContainsKey("docs/spec.md"))
+        {
+            using var mainSpecDoc = await TryGetJsonAsync(http, $"/repos/{owner}/{repo}/contents/docs/spec.md?ref={Uri.EscapeDataString(baseSha)}", ct);
+            if (mainSpecDoc is not null && mainSpecDoc.RootElement.TryGetProperty("content", out var mcp))
+            {
+                var b64 = (mcp.GetString() ?? string.Empty).Replace("\n", "").Replace("\r", "");
+                mainSpecMd = System.Text.Encoding.UTF8.GetString(Convert.FromBase64String(b64));
+            }
+        }
+
         foreach (var (path, content) in filesToCommit)
         {
+            var effectiveContent = string.Equals(path, "docs/spec.md", StringComparison.OrdinalIgnoreCase) && !string.IsNullOrWhiteSpace(mainSpecMd)
+                ? MergeSpecMarkdownFeatureLinks(mainSpecMd, content, null)
+                : content;
             try
             {
-                await UpsertRepoFileHttpAsync(http, owner, repo, path, content, $"docs: {title}", ct, branchName);
+                await UpsertRepoFileHttpAsync(http, owner, repo, path, effectiveContent, $"docs: {title}", ct, branchName);
             }
             catch (HttpRequestException ex) when (
                 path.StartsWith(".github/workflows/", StringComparison.OrdinalIgnoreCase) &&
@@ -1500,7 +1584,159 @@ public sealed class GitHubGateway(
             body = $"Automated documentation/profile update opened by Demo-Factory: {title}"
         }, ct);
 
-        return prDoc.RootElement.GetProperty("number").GetInt32();
+        var createdPrNumber = prDoc.RootElement.GetProperty("number").GetInt32();
+        await EnableAutoMergeSquashAsync(owner, repo, createdPrNumber, ct);
+        return createdPrNumber;
+    }
+
+    public async Task<bool> HasFileOnDefaultBranchAsync(string owner, string repo, string path, CancellationToken ct = default)
+    {
+        await EnsureRepoAllowlistedAsync(owner, repo, ct);
+        if (IsSandbox || string.IsNullOrWhiteSpace(path))
+            return true;
+
+        using var http = await CreateDelegatedHttpAsync(ct);
+        using var doc = await TryGetJsonAsync(http, $"/repos/{owner}/{repo}/contents/{path}", ct);
+        return doc is not null;
+    }
+
+    public async Task<string?> RebaseDocsPullRequestBranchAsync(
+        string owner,
+        string repo,
+        int prNumber,
+        string? canonicalSpecMarkdown,
+        CancellationToken ct = default)
+    {
+        await EnsureRepoAllowlistedAsync(owner, repo, ct);
+        await PaceWriteAsync(ct);
+        if (IsSandbox)
+            return null;
+
+        using var http = await CreateDelegatedHttpAsync(ct);
+        using var prDoc = await TryGetJsonAsync(http, $"/repos/{owner}/{repo}/pulls/{prNumber}", ct);
+        if (prDoc is null)
+            return null;
+
+        var prRoot = prDoc.RootElement;
+        var branchName = prRoot.GetProperty("head").GetProperty("ref").GetString()!;
+        var oldHeadSha = prRoot.GetProperty("head").GetProperty("sha").GetString()!;
+        var defaultBranch = prRoot.GetProperty("base").GetProperty("ref").GetString() ?? "main";
+
+        using var filesDoc = await TryGetJsonAsync(http, $"/repos/{owner}/{repo}/pulls/{prNumber}/files?per_page=100", ct);
+        if (filesDoc is null || filesDoc.RootElement.ValueKind != JsonValueKind.Array)
+            return null;
+
+        var filePaths = filesDoc.RootElement.EnumerateArray()
+            .Select(f => f.TryGetProperty("filename", out var fn) ? fn.GetString() ?? string.Empty : string.Empty)
+            .Where(f => f.Length > 0)
+            .ToList();
+
+        if (filePaths.Count == 0 || filePaths.Any(p => !PathGlobMatcher.IsDocsOnlyPath(p)))
+            return null;
+
+        // Read all doc files from the PR's head commit
+        var prDocFiles = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        string? prSpecMd = null;
+
+        foreach (var path in filePaths)
+        {
+            using var contentDoc = await TryGetJsonAsync(http, $"/repos/{owner}/{repo}/contents/{path}?ref={Uri.EscapeDataString(oldHeadSha)}", ct);
+            if (contentDoc is null || !contentDoc.RootElement.TryGetProperty("content", out var cp))
+                continue;
+
+            var b64 = (cp.GetString() ?? string.Empty).Replace("\n", "").Replace("\r", "");
+            var decoded = System.Text.Encoding.UTF8.GetString(Convert.FromBase64String(b64));
+            if (string.Equals(path, "docs/spec.md", StringComparison.OrdinalIgnoreCase))
+                prSpecMd = decoded;
+            else
+                prDocFiles[path] = decoded;
+        }
+
+        using var mainRefDoc = await SendGitHubRestForJsonAsync(http, HttpMethod.Get, $"/repos/{owner}/{repo}/git/ref/heads/{defaultBranch}", null, ct);
+        var mainSha = mainRefDoc.RootElement.GetProperty("object").GetProperty("sha").GetString()!;
+
+        using var mainCommitDoc = await SendGitHubRestForJsonAsync(http, HttpMethod.Get, $"/repos/{owner}/{repo}/git/commits/{mainSha}", null, ct);
+        var baseTreeSha = mainCommitDoc.RootElement.GetProperty("tree").GetProperty("sha").GetString()!;
+
+        string mainSpecMd = string.Empty;
+        using (var mainSpecDoc = await TryGetJsonAsync(http, $"/repos/{owner}/{repo}/contents/docs/spec.md?ref={Uri.EscapeDataString(mainSha)}", ct))
+        {
+            if (mainSpecDoc is not null && mainSpecDoc.RootElement.TryGetProperty("content", out var mcp))
+            {
+                var b64 = (mcp.GetString() ?? string.Empty).Replace("\n", "").Replace("\r", "");
+                mainSpecMd = System.Text.Encoding.UTF8.GetString(Convert.FromBase64String(b64));
+            }
+        }
+
+        // Build a single atomic commit on top of mainSha so the PR branch never hits 0-diff (which would cause GitHub to auto-close the PR)
+        var treeEntries = new List<object>();
+        foreach (var (path, content) in prDocFiles)
+        {
+            treeEntries.Add(new { path, mode = "100644", type = "blob", content });
+        }
+
+        if (prSpecMd is not null || !string.IsNullOrWhiteSpace(canonicalSpecMarkdown))
+        {
+            var mergedSpec = MergeSpecMarkdownFeatureLinks(mainSpecMd, prSpecMd, canonicalSpecMarkdown);
+            treeEntries.Add(new { path = "docs/spec.md", mode = "100644", type = "blob", content = mergedSpec });
+        }
+
+        using var newTreeDoc = await SendGitHubRestForJsonAsync(http, HttpMethod.Post, $"/repos/{owner}/{repo}/git/trees", new
+        {
+            base_tree = baseTreeSha,
+            tree = treeEntries.ToArray()
+        }, ct);
+        var newTreeSha = newTreeDoc.RootElement.GetProperty("sha").GetString()!;
+
+        using var newCommitDoc = await SendGitHubRestForJsonAsync(http, HttpMethod.Post, $"/repos/{owner}/{repo}/git/commits", new
+        {
+            message = $"docs(spec): rebase specification onto {defaultBranch}",
+            tree = newTreeSha,
+            parents = new[] { mainSha }
+        }, ct);
+        var newCommitSha = newCommitDoc.RootElement.GetProperty("sha").GetString()!;
+
+        await SendGitHubRestAsync(http, HttpMethod.Patch, $"/repos/{owner}/{repo}/git/refs/heads/{branchName}", new
+        {
+            sha = newCommitSha,
+            force = true
+        }, ct);
+
+        return newCommitSha;
+    }
+
+    private static string MergeSpecMarkdownFeatureLinks(string mainSpec, string? prSpec, string? canonicalSpec)
+    {
+        var baseText = !string.IsNullOrWhiteSpace(mainSpec)
+            ? mainSpec.TrimEnd()
+            : (canonicalSpec ?? prSpec ?? string.Empty).TrimEnd();
+
+        var existingLines = baseText
+            .Split('\n')
+            .Select(l => l.Trim())
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+        var extraLines = new List<string>();
+        foreach (var source in new[] { prSpec, canonicalSpec })
+        {
+            if (string.IsNullOrWhiteSpace(source))
+                continue;
+
+            foreach (var raw in source.Split('\n'))
+            {
+                var trimmed = raw.Trim();
+                if (trimmed.StartsWith("- [", StringComparison.Ordinal)
+                    && trimmed.Contains("docs/features/", StringComparison.OrdinalIgnoreCase)
+                    && existingLines.Add(trimmed))
+                {
+                    extraLines.Add(trimmed);
+                }
+            }
+        }
+
+        return extraLines.Count == 0
+            ? $"{baseText}\n"
+            : $"{baseText}\n{string.Join("\n", extraLines)}\n";
     }
 
     public async Task PostReviewGateCheckRunAsync(

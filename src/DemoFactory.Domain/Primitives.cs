@@ -122,6 +122,7 @@ public enum FeatureSpecState
     Approved,
     Applying,
     Applied,
+    Completed,
     Withdrawn
 }
 

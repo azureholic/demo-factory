@@ -908,6 +908,267 @@ public sealed class FactoryEndToEndTests : IAsyncLifetime
         }
     }
 
+    [Fact]
+    public async Task EndToEnd_SpecPrRebaseAndAutoMerge_Plus_EpicAndSourceIssueAutoClose()
+    {
+        var isolatedDb = Path.Combine(Path.GetTempPath(), $"demofactory-specpr-{Guid.NewGuid():N}.db");
+        var isolatedDir = Path.Combine(Path.GetTempPath(), $"demofactory-specpr-dir-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(isolatedDir);
+
+        var specPrMerged = false;
+        var specPrMergeableState = "dirty";
+        var specPrHeadSha = "old_spec_sha_1";
+        var closedIssueNumbers = new List<int>();
+
+        try
+        {
+            using var specFactory = new WebApplicationFactory<ApiAssemblyMarker>().WithWebHostBuilder(b =>
+            {
+                b.ConfigureAppConfiguration((_, cfg) =>
+                {
+                    cfg.AddInMemoryCollection(new Dictionary<string, string?>
+                    {
+                        ["ConnectionStrings:Sqlite"] = $"Data Source={isolatedDb}",
+                        ["Factory:SandboxMode"] = "false",
+                        ["Factory:AllowTestHeaderAuth"] = "true",
+                        ["Factory:LocalDataDirectory"] = isolatedDir,
+                        ["Factory:PoliciesDirectory"] = isolatedDir,
+                        ["Foundry:ProjectEndpoint"] = "",
+                        ["GitHub:AppId"] = "5758548",
+                        ["GitHub:AppSlug"] = "azureholic-demo-factory",
+                        ["GitHub:ClientId"] = "Iv23liUfMKApH3rhp0J4",
+                        ["GitHub:ClientSecret"] = "test-client-secret",
+                        ["GitHub:WritePaceMilliseconds"] = "1"
+                    });
+                });
+
+                b.ConfigureServices(services =>
+                {
+                    var hosted = services.FirstOrDefault(d => d.ImplementationType == typeof(BoardPollerAndSweeperWorker));
+                    if (hosted is not null) services.Remove(hosted);
+
+                    services.AddHttpClient("GitHubApi")
+                        .ConfigurePrimaryHttpMessageHandler(() => new StubGitHubHttpHandler(req =>
+                        {
+                            var path = req.RequestUri!.AbsolutePath;
+
+                            if (req.Method == HttpMethod.Get && path.EndsWith("/contents/.github/workflows/ci.yml", StringComparison.Ordinal))
+                                return StubJson(HttpStatusCode.NotFound, new { message = "Not Found" });
+
+                            if (req.Method == HttpMethod.Get && path.EndsWith("/rulesets", StringComparison.Ordinal))
+                                return StubJson(HttpStatusCode.OK, Array.Empty<object>());
+
+                            if (req.Method == HttpMethod.Get && path == "/repos/azureholic/browser-beatbox-628/pulls")
+                            {
+                                if (specPrMerged)
+                                    return StubJson(HttpStatusCode.OK, Array.Empty<object>());
+
+                                return StubJson(HttpStatusCode.OK, new[]
+                                {
+                                    new
+                                    {
+                                        number = 26,
+                                        node_id = "PR_spec_26",
+                                        title = "docs(spec): add feature Fix Beatbox API Build Failure",
+                                        body = "Automated documentation update",
+                                        draft = false,
+                                        state = "open",
+                                        merged = false,
+                                        mergeable_state = specPrMergeableState,
+                                        user = new { login = "azureholic" },
+                                        head = new { @ref = "spec/feature-fix-beatbox-api-build", sha = specPrHeadSha, repo = new { fork = false, full_name = "azureholic/browser-beatbox-628" } },
+                                        @base = new { @ref = "main" }
+                                    }
+                                });
+                            }
+
+                            if (req.Method == HttpMethod.Get && path == "/repos/azureholic/browser-beatbox-628/pulls/26")
+                            {
+                                return StubJson(HttpStatusCode.OK, new
+                                {
+                                    number = 26,
+                                    node_id = "PR_spec_26",
+                                    title = "docs(spec): add feature Fix Beatbox API Build Failure",
+                                    body = "Automated documentation update",
+                                    draft = false,
+                                    state = specPrMerged ? "closed" : "open",
+                                    merged = specPrMerged,
+                                    mergeable_state = specPrMergeableState,
+                                    requested_reviewers = Array.Empty<object>(),
+                                    user = new { login = "azureholic" },
+                                    head = new { @ref = "spec/feature-fix-beatbox-api-build", sha = specPrHeadSha, repo = new { fork = false, full_name = "azureholic/browser-beatbox-628" } },
+                                    @base = new { @ref = "main" }
+                                });
+                            }
+
+                            if (req.Method == HttpMethod.Get && path == "/repos/azureholic/browser-beatbox-628/issues/26/timeline")
+                                return StubJson(HttpStatusCode.OK, Array.Empty<object>());
+
+                            if (req.Method == HttpMethod.Get && path == "/repos/azureholic/browser-beatbox-628/pulls/26/files")
+                            {
+                                return StubJson(HttpStatusCode.OK, new[]
+                                {
+                                    new { filename = "docs/features/002-fix-beatbox-api-build.md", additions = 20, deletions = 0, status = "added" },
+                                    new { filename = "docs/spec.md", additions = 2, deletions = 0, status = "modified" }
+                                });
+                            }
+
+                            if (req.Method == HttpMethod.Get && path.StartsWith("/repos/azureholic/browser-beatbox-628/contents/docs/", StringComparison.Ordinal))
+                            {
+                                var sampleMd = path.EndsWith("docs/spec.md", StringComparison.Ordinal)
+                                    ? "# Beatbox\n- [001 - NPM](docs/features/001-npm.md)\n"
+                                    : "# Feature 002\nDetails";
+                                return StubJson(HttpStatusCode.OK, new { sha = "doc_sha", content = Convert.ToBase64String(Encoding.UTF8.GetBytes(sampleMd)) });
+                            }
+
+                            if (req.Method == HttpMethod.Get && path.EndsWith("/git/ref/heads/main", StringComparison.Ordinal))
+                                return StubJson(HttpStatusCode.OK, new { @object = new { sha = "main_head_sha_99" } });
+
+                            if (req.Method == HttpMethod.Get && path.EndsWith("/git/commits/main_head_sha_99", StringComparison.Ordinal))
+                                return StubJson(HttpStatusCode.OK, new { sha = "main_head_sha_99", tree = new { sha = "main_tree_sha_99" } });
+
+                            if (req.Method == HttpMethod.Post && path.EndsWith("/git/trees", StringComparison.Ordinal))
+                                return StubJson(HttpStatusCode.Created, new { sha = "rebased_tree_sha_2" });
+
+                            if (req.Method == HttpMethod.Post && path.EndsWith("/git/commits", StringComparison.Ordinal))
+                                return StubJson(HttpStatusCode.Created, new { sha = "rebased_spec_sha_2" });
+
+                            if (req.Method == HttpMethod.Patch && path.Contains("/git/refs/heads/spec/", StringComparison.Ordinal))
+                            {
+                                specPrHeadSha = "rebased_spec_sha_2";
+                                specPrMergeableState = "clean";
+                                return StubJson(HttpStatusCode.OK, new { @ref = "refs/heads/spec/feature-fix-beatbox-api-build" });
+                            }
+
+                            if (req.Method == HttpMethod.Put && path.StartsWith("/repos/azureholic/browser-beatbox-628/contents/docs/", StringComparison.Ordinal))
+                                return StubJson(HttpStatusCode.OK, new { content = new { sha = "updated_doc_sha" } });
+
+                            if (req.Method == HttpMethod.Get && path.Contains("/check-runs", StringComparison.Ordinal))
+                                return StubJson(HttpStatusCode.OK, new { total_count = 0, check_runs = Array.Empty<object>() });
+
+                            if (req.Method == HttpMethod.Get && (path.EndsWith("/reviews", StringComparison.Ordinal) || path.EndsWith("/comments", StringComparison.Ordinal)))
+                                return StubJson(HttpStatusCode.OK, Array.Empty<object>());
+
+                            if (req.Method == HttpMethod.Post && path == "/graphql")
+                                return StubJson(HttpStatusCode.OK, new { data = new { enablePullRequestAutoMerge = new { pullRequest = new { id = "PR_spec_26" } } } });
+
+                            if (req.Method == HttpMethod.Put && path == "/repos/azureholic/browser-beatbox-628/pulls/26/merge")
+                            {
+                                specPrMerged = true;
+                                return StubJson(HttpStatusCode.OK, new { sha = "merged_spec_26", merged = true });
+                            }
+
+                            if (req.Method == HttpMethod.Patch && path.StartsWith("/repos/azureholic/browser-beatbox-628/issues/", StringComparison.Ordinal))
+                            {
+                                var body = req.Content!.ReadAsStringAsync().GetAwaiter().GetResult();
+                                if (body.Contains("\"closed\"", StringComparison.Ordinal))
+                                {
+                                    var numStr = path.Split('/').Last();
+                                    if (int.TryParse(numStr, out var issueNum))
+                                    {
+                                        lock (closedIssueNumbers) closedIssueNumbers.Add(issueNum);
+                                    }
+                                }
+                                return StubJson(HttpStatusCode.OK, new { state = "closed" });
+                            }
+
+                            return StubJson(HttpStatusCode.OK, new { ok = true });
+                        }));
+                });
+            });
+
+            using var _ = specFactory.CreateClient();
+            var broker = specFactory.Services.GetRequiredService<ITokenBroker>();
+            await broker.StoreRotatedTokensAsync("azureholic", "ghu_live_spec_token", TimeSpan.FromHours(8), "ghr_live_spec_refresh", TimeSpan.FromDays(90));
+
+            var dbFactory = specFactory.Services.GetRequiredService<IDbContextFactory<DemoFactoryDbContext>>();
+            Guid repoId;
+            Guid featId;
+            await using (var db = await dbFactory.CreateDbContextAsync())
+            {
+                var proj = new ProjectEntity
+                {
+                    Name = "Browser Beatbox",
+                    Slug = "browser-beatbox-628",
+                    SpecMarkdown = "# Beatbox\n- [001 - NPM](docs/features/001-npm.md)\n- [002 - Fix Build](docs/features/002-fix-beatbox-api-build.md)\n",
+                    TemplateId = "dotnet-react",
+                    IsPublic = true
+                };
+                db.Projects.Add(proj);
+                var repo = new RepositoryEntity { ProjectId = proj.Id, Owner = "azureholic", Name = "browser-beatbox-628", InstallationId = 0 };
+                db.Repositories.Add(repo);
+                db.LineStates.Add(new LineStateEntity { RepoId = repo.Id, State = LineStatus.Running });
+
+                var feat = new FeatureSpecEntity
+                {
+                    ProjectId = proj.Id,
+                    Title = "Fix Beatbox API Build Failure",
+                    Slug = "fix-beatbox-api-build",
+                    Path = "docs/features/002-fix-beatbox-api-build.md",
+                    SpecMarkdown = "# Feature: Fix Beatbox API Build Failure",
+                    EpicIssueNumber = 27,
+                    SourceIssueNumbersJson = "[19]",
+                    State = FeatureSpecState.Applied
+                };
+                db.FeatureSpecs.Add(feat);
+
+                db.InboxItems.Add(new InboxItemEntity
+                {
+                    ProjectId = proj.Id,
+                    RepoId = repo.Id,
+                    FeatureId = feat.Id,
+                    IssueNumber = 19,
+                    Title = "Beatbox API fails to build",
+                    Body = "npm build error",
+                    Author = "azureholic",
+                    State = InboxItemState.Done
+                });
+
+                db.WorkItems.Add(new WorkItemEntity
+                {
+                    RepoId = repo.Id,
+                    FeatureId = feat.Id,
+                    FeatureSlug = feat.Slug,
+                    IssueNumber = 28,
+                    IssueNodeId = "I_kwDO_28",
+                    Title = "Fix MSBuild SPA target",
+                    BodyMarkdown = "Fix target",
+                    AcceptanceCriteriaJson = "[\"Builds cleanly\"]",
+                    LabelsJson = "[\"factory\",\"feature:fix-beatbox-api-build\"]",
+                    IssueAuthor = "azureholic",
+                    WorkLabelAppliedBy = "azureholic",
+                    PassesWorkLabelRule = true,
+                    State = WorkItemStateKind.Merged,
+                    BoardStatus = BoardStatus.Done,
+                    MergedAt = DateTimeOffset.UtcNow
+                });
+
+                await db.SaveChangesAsync();
+                repoId = repo.Id;
+                featId = feat.Id;
+            }
+
+            var coordinator = specFactory.Services.GetRequiredService<IFactoryOrchestrationCoordinator>();
+            var progressed = await coordinator.ReconcileActiveWorkItemsOnceAsync(repoId);
+
+            Assert.True(progressed > 0);
+            Assert.True(specPrMerged);
+            Assert.Contains(27, closedIssueNumbers); // Epic #27 closed!
+            Assert.Contains(19, closedIssueNumbers); // Source bug #19 closed!
+
+            await using (var db = await dbFactory.CreateDbContextAsync())
+            {
+                var updatedFeat = await db.FeatureSpecs.FirstAsync(f => f.Id == featId);
+                Assert.Equal(FeatureSpecState.Completed, updatedFeat.State);
+            }
+        }
+        finally
+        {
+            if (File.Exists(isolatedDb)) { try { File.Delete(isolatedDb); } catch { } }
+            if (Directory.Exists(isolatedDir)) { try { Directory.Delete(isolatedDir, recursive: true); } catch { } }
+        }
+    }
+
     private static HttpResponseMessage StubJson(HttpStatusCode code, object payload) =>
         new(code)
         {

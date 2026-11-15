@@ -73,7 +73,8 @@ public sealed record RoundSignalsEvent(
     IReadOnlyList<string> CiFailureExcerpts,
     bool SpecConformancePassed = true,
     IReadOnlyList<CheckRunSnapshot>? ActualCheckRuns = null,
-    bool? PreviewWorkflowSucceeded = null);
+    bool? PreviewWorkflowSucceeded = null,
+    bool HasCiWorkflow = true);
 
 public sealed record OperatorDecisionEvent(
     ApprovalDecision Decision,
