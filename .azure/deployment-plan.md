@@ -3,7 +3,7 @@
 > **Status:** Deployed
 
 Generated: 2026-11-14T10:38:00+01:00
-Updated: 2026-11-14T15:25:00+01:00
+Updated: 2026-11-17T11:33:00+01:00
 
 ---
 
@@ -123,6 +123,25 @@ Updated: 2026-11-14T15:25:00+01:00
 ---
 
 ## 7. Validation Proof (Local Build, Test & IaC)
+
+### Application-only release revalidation: 2026-11-17
+
+- Target: existing `demofactory-dev-swc`, subscription `05ad4d79-8611-4df8-9193-f96001436be9`, resource group `rg-demofactory-dev-swc`, Sweden Central.
+- `dotnet test DemoFactory.slnx --no-restore --nologo -c Release`: passed, 31 tests (10 Domain, 12 Orchestrator, 9 E2E).
+- `npm run build` and `npm test` in `web`: passed; one frontend test. Existing bundler size/annotation warnings only.
+- `Azure-MCP-azd validate_azure_yaml`: valid against the stable schema.
+- `azd auth login --check-status`, environment/subscription checks: passed.
+- `azd provision --preview --no-prompt -e demofactory-dev-swc`: passed, read-only preview. No infrastructure changes will be applied for this application-only release.
+- `azd package web -e demofactory-dev-swc --no-prompt`: passed (remote Docker build is deferred to deployment; no local artifacts).
+- Docker context: root `Dockerfile` uses supported GA Node.js 22 Alpine for SPA build and .NET 11 SDK/ASP.NET runtime. Frontend build passed; production container runs .NET, not Node.js.
+- Static Bicep role assignments and live runtime identity roles verified: ACR pull, Key Vault crypto, Blob data contributor, Durable Task data contributor, and Foundry access are scoped to their resources. No new roles or schema migrations required.
+- Existing Container Apps environment is healthy; exactly one resource is tagged `azd-service-name=web` in the target resource group.
+- Azure Policy assignments checked; no new resources/SKUs/regions are being introduced. No Aspire Functions resources; explicit Bicep deployment, not Aspire limited mode.
+- `azd deploy web -e demofactory-dev-swc --no-prompt`: succeeded, application-only release `bbf595133355ab6b85ac9224e1c2d77fc1b70a56`.
+- Runtime image: `crdemofactorydevswc7x73n.azurecr.io/demo-factory/web-demofactory-dev-swc:azd-deploy-1794911276`.
+- Ready revision: `ca-demofactory-web-dev-swc--azd-1794911482`, Healthy, 100% traffic. `azd show` confirmed endpoint; `/healthz` and `/` both returned HTTP 200.
+- GitHub CI: passed, https://github.com/azureholic/demo-factory/actions/runs/44065009726.
+- Runtime warning: workflow-file backfill requests on `azureholic/browser-beatbox-628` receive HTTP 403 (`Resource not accessible by integration`); GitHub App workflow-write permission requires owner attention. No permission changes were made by this release.
 
 | Check | Command Run | Result |
 |-------|-------------|--------|
