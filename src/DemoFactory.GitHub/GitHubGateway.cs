@@ -73,6 +73,12 @@ public sealed record LivePullRequestGateSignals(
     IReadOnlyList<RawReviewComment> ReviewComments,
     IReadOnlyList<ChangedFileDiff> ChangedFiles);
 
+public sealed record PullRequestWorkflowRun(
+    long Id,
+    string Status,
+    string? Conclusion,
+    IReadOnlyList<string> JobNames);
+
 public interface IGitHubGateway
 {
     Task<AppInstallationCheckResult> CheckAppInstallationAsync(string owner, string? repo = null, CancellationToken ct = default);
@@ -105,8 +111,10 @@ public interface IGitHubGateway
     Task<int> OpenDocsPullRequestAsync(string owner, string repo, string branchName, string title, IReadOnlyDictionary<string, string> filesToCommit, CancellationToken ct = default);
     Task PostReviewGateCheckRunAsync(long installationId, string owner, string repo, string headSha, GateEvaluationResult result, CancellationToken ct = default);
     Task PostCommentAsync(string owner, string repo, int issueOrPrNumber, string markdownBody, CancellationToken ct = default);
-    Task RequestCopilotReviewWatchdogAsync(string owner, string repo, int prNumber, CancellationToken ct = default);
+    Task<bool> RequestCopilotReviewWatchdogAsync(string owner, string repo, int prNumber, CancellationToken ct = default);
     Task RerunFailedWorkflowJobsAsync(string owner, string repo, long runId, CancellationToken ct = default);
+    Task<IReadOnlyList<PullRequestWorkflowRun>> GetPullRequestWorkflowRunsAsync(string owner, string repo, int prNumber, string headSha, CancellationToken ct = default);
+    Task<bool> TryRecoverWorkflowRunAsync(string owner, string repo, int prNumber, string headSha, long runId, bool cancel, CancellationToken ct = default);
     Task<IReadOnlyList<ReadinessCheckItem>> EvaluateRepositoryReadinessAsync(string owner, string repo, CancellationToken ct = default);
     Task<int> OpenOnboardingProfilePrAsync(string owner, string repo, CancellationToken ct = default);
 }
@@ -1851,15 +1859,16 @@ public sealed class GitHubGateway(
             ct: ct);
     }
 
-    public async Task RequestCopilotReviewWatchdogAsync(string owner, string repo, int prNumber, CancellationToken ct = default)
+    public async Task<bool> RequestCopilotReviewWatchdogAsync(string owner, string repo, int prNumber, CancellationToken ct = default)
     {
         await EnsureRepoAllowlistedAsync(owner, repo, ct);
         await PaceWriteAsync(ct);
 
+        var requested = true;
         if (!IsSandbox)
         {
             using var http = await CreateDelegatedHttpAsync(ct);
-            await TrySendGitHubRestAsync(http, HttpMethod.Post, $"/repos/{owner}/{repo}/pulls/{prNumber}/requested_reviewers", new
+            requested = await TrySendGitHubRestAsync(http, HttpMethod.Post, $"/repos/{owner}/{repo}/pulls/{prNumber}/requested_reviewers", new
             {
                 reviewers = new[] { "copilot-pull-request-reviewer[bot]" }
             }, ct);
@@ -1867,11 +1876,12 @@ public sealed class GitHubGateway(
 
         await auditLogger.RecordAsync(
             "factory-watchdog",
-            "CopilotReviewWatchdogRequested",
+            requested ? "CopilotReviewWatchdogRequested" : "CopilotReviewWatchdogUnavailable",
             "PullRequest",
             $"{owner}/{repo}#{prNumber}",
             prNumber: prNumber,
             ct: ct);
+        return requested;
     }
 
     public async Task RerunFailedWorkflowJobsAsync(string owner, string repo, long runId, CancellationToken ct = default)
@@ -1883,6 +1893,67 @@ public sealed class GitHubGateway(
             await SendGitHubRestAsync(http, HttpMethod.Post, $"/repos/{owner}/{repo}/actions/runs/{runId}/rerun-failed-jobs", null, ct);
         }
     }
+
+    public async Task<IReadOnlyList<PullRequestWorkflowRun>> GetPullRequestWorkflowRunsAsync(
+        string owner, string repo, int prNumber, string headSha, CancellationToken ct = default)
+    {
+        await EnsureRepoAllowlistedAsync(owner, repo, ct);
+        if (IsSandbox)
+            return [];
+
+        using var http = await CreateDelegatedHttpAsync(ct);
+        using var runs = await SendGitHubRestForJsonAsync(http, HttpMethod.Get,
+            $"/repos/{owner}/{repo}/actions/runs?head_sha={Uri.EscapeDataString(headSha)}&event=pull_request&per_page=100", null, ct);
+        var result = new List<PullRequestWorkflowRun>();
+        foreach (var run in runs.RootElement.GetProperty("workflow_runs").EnumerateArray())
+        {
+            if (!IsWorkflowRunForPullRequest(run, owner, repo, prNumber, headSha))
+                continue;
+
+            var id = run.GetProperty("id").GetInt64();
+            using var jobs = await SendGitHubRestForJsonAsync(http, HttpMethod.Get,
+                $"/repos/{owner}/{repo}/actions/runs/{id}/jobs?filter=latest&per_page=100", null, ct);
+            result.Add(new PullRequestWorkflowRun(id, run.GetProperty("status").GetString() ?? string.Empty,
+                run.GetProperty("conclusion").GetString(),
+                jobs.RootElement.GetProperty("jobs").EnumerateArray()
+                    .Select(j => j.GetProperty("name").GetString() ?? string.Empty).ToList()));
+        }
+        return result;
+    }
+
+    public async Task<bool> TryRecoverWorkflowRunAsync(
+        string owner, string repo, int prNumber, string headSha, long runId, bool cancel, CancellationToken ct = default)
+    {
+        await EnsureRepoAllowlistedAsync(owner, repo, ct);
+        if (IsSandbox)
+            return false;
+
+        using var http = await CreateDelegatedHttpAsync(ct);
+        using var pr = await SendGitHubRestForJsonAsync(http, HttpMethod.Get, $"/repos/{owner}/{repo}/pulls/{prNumber}", null, ct);
+        using var run = await SendGitHubRestForJsonAsync(http, HttpMethod.Get, $"/repos/{owner}/{repo}/actions/runs/{runId}", null, ct);
+        var status = run.RootElement.GetProperty("status").GetString();
+        if (pr.RootElement.GetProperty("state").GetString() != "open"
+            || !string.Equals(pr.RootElement.GetProperty("head").GetProperty("sha").GetString(), headSha, StringComparison.OrdinalIgnoreCase)
+            || !IsWorkflowRunForPullRequest(run.RootElement, owner, repo, prNumber, headSha)
+            || (cancel ? status is not ("queued" or "in_progress") : status != "completed"))
+        {
+            logger.LogInformation("Skipped stale or ineligible workflow recovery for {Owner}/{Repo} PR {PrNumber}, run {RunId}", owner, repo, prNumber, runId);
+            return false;
+        }
+
+        await PaceWriteAsync(ct);
+        await SendGitHubRestAsync(http, HttpMethod.Post,
+            $"/repos/{owner}/{repo}/actions/runs/{runId}/{(cancel ? "cancel" : "rerun")}", null, ct);
+        return true;
+    }
+
+    private static bool IsWorkflowRunForPullRequest(JsonElement run, string owner, string repo, int prNumber, string headSha) =>
+        string.Equals(run.GetProperty("head_sha").GetString(), headSha, StringComparison.OrdinalIgnoreCase)
+        && run.GetProperty("event").GetString() == "pull_request"
+        && run.TryGetProperty("head_repository", out var headRepo)
+        && headRepo.ValueKind == JsonValueKind.Object
+        && string.Equals(headRepo.GetProperty("full_name").GetString(), $"{owner}/{repo}", StringComparison.OrdinalIgnoreCase)
+        && run.GetProperty("pull_requests").EnumerateArray().Any(p => p.GetProperty("number").GetInt32() == prNumber);
 
     public async Task<IReadOnlyList<ReadinessCheckItem>> EvaluateRepositoryReadinessAsync(string owner, string repo, CancellationToken ct = default)
     {
@@ -2255,9 +2326,13 @@ public sealed class GitHubGateway(
                 foreach (var ev in timelineDoc.RootElement.EnumerateArray())
                 {
                     var evType = ev.TryGetProperty("event", out var et) ? et.GetString() : null;
-                    if (string.Equals(evType, "copilot_work_started", StringComparison.OrdinalIgnoreCase))
+                    var isCodingAgent = ev.TryGetProperty("performed_via_github_app", out var app)
+                        && app.ValueKind == JsonValueKind.Object
+                        && app.TryGetProperty("slug", out var slug)
+                        && string.Equals(slug.GetString(), "copilot-swe-agent", StringComparison.OrdinalIgnoreCase);
+                    if (isCodingAgent && string.Equals(evType, "copilot_work_started", StringComparison.OrdinalIgnoreCase))
                         lastStartIdx = idx;
-                    else if (string.Equals(evType, "copilot_work_finished", StringComparison.OrdinalIgnoreCase))
+                    else if (isCodingAgent && string.Equals(evType, "copilot_work_finished", StringComparison.OrdinalIgnoreCase))
                     {
                         lastFinishIdx = idx;
                         if (ev.TryGetProperty("created_at", out var ca) && ca.ValueKind == JsonValueKind.String && DateTimeOffset.TryParse(ca.GetString(), out var parsedTs))

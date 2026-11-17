@@ -732,8 +732,9 @@ public sealed class FactoryEndToEndTests : IAsyncLifetime
                             {
                                 return StubJson(HttpStatusCode.OK, new object[]
                                 {
-                                    new { @event = "copilot_work_started" },
-                                    new { @event = "copilot_work_finished" }
+                                    new { @event = "copilot_work_started", performed_via_github_app = new { slug = "copilot-swe-agent" } },
+                                    new { @event = "copilot_work_finished", performed_via_github_app = new { slug = "copilot-swe-agent" } },
+                                    new { @event = "copilot_work_started", performed_via_github_app = new { slug = "copilot-pull-request-reviewer" } }
                                 });
                             }
 

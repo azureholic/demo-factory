@@ -17,6 +17,7 @@ public sealed class RepoPolicy
     public IntakePolicy Intake { get; set; } = new();
     public PolicyModels Models { get; set; } = new();
     public ReviewPolicy Review { get; set; } = new();
+    public PrWatchdogPolicy PrWatchdog { get; set; } = new();
     public GatePolicySettings Gate { get; set; } = new();
     public AcceptanceTestPolicy AcceptanceTests { get; set; } = new();
     public List<string> ProtectedPaths { get; set; } = DefaultProtectedPaths();
@@ -102,6 +103,15 @@ public sealed class ReviewPolicy
     public FindingSeverity BlockingSeverity { get; set; } = FindingSeverity.Medium;
     public int MaxRounds { get; set; } = 3;
     public ContestedSeverityPolicy ContestedPolicy { get; set; } = new();
+}
+
+public sealed class PrWatchdogPolicy
+{
+    public bool Enabled { get; set; } = true;
+    public int NoProgressMinutes { get; set; } = 20;
+    public int AgentNoProgressMinutes { get; set; } = 90;
+    public int RetryCooldownMinutes { get; set; } = 5;
+    public int MaxRecoveryActionsPerHead { get; set; } = 2;
 }
 
 public sealed class ContestedSeverityPolicy

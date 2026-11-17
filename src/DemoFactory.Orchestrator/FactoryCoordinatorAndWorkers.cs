@@ -46,7 +46,7 @@ public interface IFactoryOrchestrationCoordinator
 /// - Webhook event routing with strict §11.4 trust-boundary filtering
 /// - Board Poller (§4.1) & 72h Preview Sweeper (§6.4)
 /// </summary>
-public sealed class FactoryOrchestrationCoordinator(
+public sealed partial class FactoryOrchestrationCoordinator(
     IDbContextFactory<DemoFactoryDbContext> dbFactory,
     IGitHubGateway gitHub,
     ICopilotAgentClient copilot,
@@ -455,6 +455,7 @@ public sealed class FactoryOrchestrationCoordinator(
         }
 
         wi.State = WorkItemStateKind.Fixing;
+        wi.CurrentRound = round;
         wi.UpdatedAt = DateTimeOffset.UtcNow;
         await db.SaveChangesAsync(ct);
 
@@ -1588,11 +1589,20 @@ public sealed class FactoryOrchestrationCoordinator(
                                 }
                                 progressed++;
                             }
+                            else
+                            {
+                                await WatchWorkItemProgressAsync(db, repo, wi, policy, effectiveAutonomyForRepo,
+                                    lineState?.State ?? LineStatus.Running, single, null, ct);
+                            }
                             continue;
                         }
 
                         if (matchedPr is null)
+                        {
+                            await WatchWorkItemProgressAsync(db, repo, wi, policy, effectiveAutonomyForRepo,
+                                lineState?.State ?? LineStatus.Running, null, null, ct);
                             continue;
+                        }
 
                         // Enforce trusted PR origin (§11.4)
                         var (trusted, _) = TrustBoundary.EvaluateTrustedPrOrigin(new TrustedOriginContext(
@@ -1613,6 +1623,18 @@ public sealed class FactoryOrchestrationCoordinator(
                             wi.HeadSha = matchedPr.HeadSha;
                             wi.UpdatedAt = DateTimeOffset.UtcNow;
                             await db.SaveChangesAsync(ct);
+                        }
+
+                        LivePullRequestGateSignals? watchdogSignals = null;
+                        if (!matchedPr.IsDraft && !matchedPr.CopilotWorkInProgress)
+                        {
+                            watchdogSignals = await gitHub.GetPullRequestGateSignalsAsync(repo.Owner, repo.Name, matchedPr.Number, matchedPr.HeadSha, ct);
+                        }
+                        if (await WatchWorkItemProgressAsync(db, repo, wi, policy, effectiveAutonomyForRepo,
+                            lineState?.State ?? LineStatus.Running, matchedPr, watchdogSignals, ct))
+                        {
+                            progressed++;
+                            continue;
                         }
 
                         // Wait while Copilot cloud agent is actively working on commits
@@ -1662,7 +1684,8 @@ public sealed class FactoryOrchestrationCoordinator(
                         // Non-draft PR in Validating / AwaitingApproval / AwaitingMerge -> evaluate live gate signals
                         if (!matchedPr.IsDraft && wi.State is WorkItemStateKind.Validating or WorkItemStateKind.AwaitingApproval or WorkItemStateKind.AwaitingMerge)
                         {
-                            var liveSignals = await gitHub.GetPullRequestGateSignalsAsync(repo.Owner, repo.Name, matchedPr.Number, matchedPr.HeadSha, ct);
+                            var liveSignals = watchdogSignals
+                                ?? await gitHub.GetPullRequestGateSignalsAsync(repo.Owner, repo.Name, matchedPr.Number, matchedPr.HeadSha, ct);
                             if (liveSignals.Merged)
                             {
                                 await CompleteMergedWorkItemActivityAsync(wi.Id, matchedPr.Number, liveSignals.HeadSha, ct);
@@ -1679,6 +1702,10 @@ public sealed class FactoryOrchestrationCoordinator(
                                     string.Equals(cr.Name, reqName, StringComparison.OrdinalIgnoreCase)
                                     && string.Equals(cr.Sha, liveSignals.HeadSha, StringComparison.OrdinalIgnoreCase)
                                     && string.Equals(cr.Status, "completed", StringComparison.OrdinalIgnoreCase)));
+
+                            // Pending checks cannot pass the gate or trigger a fix round.
+                            if (!allChecksCompleted)
+                                continue;
 
                             if (string.Equals(liveSignals.MergeableState, "behind", StringComparison.OrdinalIgnoreCase) && allChecksCompleted)
                             {
@@ -1699,6 +1726,9 @@ public sealed class FactoryOrchestrationCoordinator(
                                 && !liveSignals.CopilotReviewerRequested
                                 && allChecksCompleted
                                 && (DateTimeOffset.UtcNow - wi.UpdatedAt) > TimeSpan.FromSeconds(90);
+
+                            if (allChecksGreen && !liveSignals.HasCopilotReviewOnHeadSha && !carryOverReview)
+                                continue;
 
                             var checkDigest = string.Join("|", liveSignals.CheckRuns
                                 .Where(c => !string.Equals(c.Name, ReviewGateEvaluator.GateCheckName, StringComparison.OrdinalIgnoreCase))
